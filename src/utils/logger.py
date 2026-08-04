@@ -36,13 +36,14 @@ def _configure_root_logger() -> None:
     global _configured
     if _configured:
         return
-    _configured = True
 
     root = logging.getLogger(_ROOT_LOGGER_NAME)
     root.setLevel(logging.DEBUG)  # Capture all logs; handlers filter by level
+    root.propagate = False
 
     # Avoid adding duplicate handlers if module is reloaded
     if root.handlers:
+        _configured = True
         return
 
     # ── Console Handler ──────────────────────────────────────────────────────
@@ -58,6 +59,7 @@ def _configure_root_logger() -> None:
         )
     )
     root.addHandler(console_handler)
+    _configured = True
 
     # ── Optional File Handler ────────────────────────────────────────────────
     log_file = os.environ.get("LOG_FILE", "").strip()
