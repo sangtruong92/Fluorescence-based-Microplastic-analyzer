@@ -10,6 +10,9 @@ from typing import List, Dict
 
 from config.settings import PreprocessingParams, AnalysisResult
 from src.core import ImageProcessor, ShapeAnalyzer, ColorAnalyzer
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class DeepAnalyzer:
@@ -52,7 +55,7 @@ class DeepAnalyzer:
         
         # Debug info
         mask_pixels = np.sum(mask > 0)
-        print(f"DEBUG: Mask has {mask_pixels} white pixels, method={params.method}, min_area={params.min_area}")
+        logger.debug(f"Mask has {mask_pixels} white pixels, method={params.method}, min_area={params.min_area}")
         
         # Detect background
         bg_color = self.image_processor.detect_background_color(image)
@@ -62,7 +65,7 @@ class DeepAnalyzer:
         
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        print(f"DEBUG: Found {len(contours)} contours")
+        logger.debug(f"Found {len(contours)} contours")
         
         # Extract detailed features (filter boundary objects for accurate metrics)
         features = []
@@ -130,7 +133,7 @@ class DeepAnalyzer:
         avg_time_per_object = processing_time / len(features) if features else 0
         
         if boundary_objects_removed > 0:
-            print(f"[Deep Analysis] Removed {boundary_objects_removed} boundary objects (touching edges)")
+            logger.info(f"Removed {boundary_objects_removed} boundary objects (touching image edges)")
         
         return AnalysisResult(
             features=features,
