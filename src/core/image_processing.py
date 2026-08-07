@@ -259,7 +259,7 @@ class ImageProcessor:
             if method == 'brightfield':
                 return ImageProcessor._preprocess_brightfield(img_bgr, min_size, **kwargs)
         except Exception as e:
-            logger.error(f"ERROR in preprocessing ({method}): {str(e)}")
+            logger.exception("Error in preprocessing (%s): %s", method, e)
             return ImageProcessor._preprocess_basic(img_bgr, min_size, **kwargs)
         
         return ImageProcessor._preprocess_advanced(img_bgr, min_size, **kwargs)
