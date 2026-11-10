@@ -190,6 +190,10 @@ sudo apt-get install -y python3-dev python3-pip
 sudo apt-get install -y libgl1-mesa-glx libglib2.0-0  # For OpenCV
 sudo apt-get install -y libxkbcommon-x11-0  # For PyQt5
 
+# Raspberry Pi AI Camera (libcamera/Picamera2)
+sudo apt-get install -y python3-picamera2 libcamera-apps
+libcamera-hello  # Verify that the camera is detected
+
 # Fedora/RHEL
 sudo dnf install -y python3-devel
 sudo dnf install -y mesa-libGL glib2  # For OpenCV
@@ -202,6 +206,14 @@ python3 -m venv venv
 
 # Activate virtual environment
 source venv/bin/activate
+```
+
+On Raspberry Pi, Picamera2 is installed by apt. If you use a virtual
+environment, create it with `--system-site-packages` so the application can
+import Picamera2:
+
+```bash
+python3 -m venv --system-site-packages venv
 ```
 
 #### Step 4: Install Python Dependencies
