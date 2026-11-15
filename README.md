@@ -65,6 +65,29 @@ Automatic classification into 5 morphometric categories:
 - **Color Analysis:** HSV-based classification with fluorescent support
 - **Camera Calibration:** Convert pixel measurements to real-world micrometers
 
+### Recent Updates Integrated from a Colleague's Branch
+
+The combined project includes the following additions and improvements from a
+colleague's code:
+
+- **A REST API for application integrations**, with endpoints for image
+  analysis, batch benchmarking, calibration, and synthetic-data generation.
+- **More reliable YOLO benchmarking**, including consistent class labels,
+  object-level matching by bounding-box overlap, raw-detection tracking, and
+  saved benchmark snapshots for reviewing results.
+- **Improved synthetic-data and YOLO export workflows**, using particle
+  bounding boxes derived from the generated masks and including updated YOLO
+  model versions.
+- **Analysis and calibration refinements**, plus clearer diagnostics, API
+  documentation, and regression tests for the benchmark and export workflows.
+
+See the [development changelog](docs/development_changelog.md) for a detailed
+technical walkthrough, the [YOLO evaluation audit](docs/yolo_evaluation_audit_and_retrain_plan.md)
+for the model and benchmark findings, and the
+[benchmark comparison](docs/benchmark_compare_before_after.md) for before-and-after
+results. The Raspberry Pi AI Camera support and low-light image handling are
+also retained in this combined version.
+
 ### Camera Calibration & Size Measurement
 
 Calculate real-world particle sizes from camera images:
@@ -190,6 +213,10 @@ sudo apt-get install -y python3-dev python3-pip
 sudo apt-get install -y libgl1-mesa-glx libglib2.0-0  # For OpenCV
 sudo apt-get install -y libxkbcommon-x11-0  # For PyQt5
 
+# Raspberry Pi AI Camera (libcamera/Picamera2)
+sudo apt-get install -y python3-picamera2 libcamera-apps
+libcamera-hello  # Verify that the camera is detected
+
 # Fedora/RHEL
 sudo dnf install -y python3-devel
 sudo dnf install -y mesa-libGL glib2  # For OpenCV
@@ -202,6 +229,14 @@ python3 -m venv venv
 
 # Activate virtual environment
 source venv/bin/activate
+```
+
+On Raspberry Pi, Picamera2 is installed by apt. If you use a virtual
+environment, create it with `--system-site-packages` so the application can
+import Picamera2:
+
+```bash
+python3 -m venv --system-site-packages venv
 ```
 
 #### Step 4: Install Python Dependencies
@@ -859,13 +894,14 @@ MircrosPlastic_Software/
 │   ├── constants.py        # Shape thresholds, color definitions
 │   └── settings.py         # Preprocessing parameters
 ├── src/
-│   ├── analysis/           # Quick and Deep analyzers
+│   ├── analysis/           # Quick, Deep, and ML Benchmark analyzers
 │   ├── core/               # Image processing, shape analysis
 │   │   └── calibration.py  # Camera calibration module
 │   ├── data_generation/    # Synthetic image generator
 │   ├── gui/                # PyQt5 interface
-│   └── ml/                 # YOLO integration
-├── models/                 # Pre-trained YOLO models
+│   └── ml/                 # YOLO integration, incl. src/ml/<version>/best.pt (pre-trained weights)
+├── api/                    # FastAPI backend for frontend integration (run_api.py)
+├── examples/               # Runnable demo scripts (not pytest tests)
 ├── docs/                   # Documentation
 │   ├── README.md           # Documentation index
 │   ├── camera_calibration_guide.md

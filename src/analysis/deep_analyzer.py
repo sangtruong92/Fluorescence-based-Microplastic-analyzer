@@ -3,6 +3,7 @@ Analysis Module - Deep Analyzer
 Detailed analysis with advanced metrics
 """
 
+import logging
 import cv2
 import numpy as np
 import time
@@ -10,6 +11,8 @@ from typing import List, Dict
 
 from config.settings import PreprocessingParams, AnalysisResult
 from src.core import ImageProcessor, ShapeAnalyzer, ColorAnalyzer
+
+logger = logging.getLogger(__name__)
 
 
 class DeepAnalyzer:
@@ -52,7 +55,7 @@ class DeepAnalyzer:
         
         # Debug info
         mask_pixels = np.sum(mask > 0)
-        print(f"DEBUG: Mask has {mask_pixels} white pixels, method={params.method}, min_area={params.min_area}")
+        logger.debug(f"DEBUG: Mask has {mask_pixels} white pixels, method={params.method}, min_area={params.min_area}")
         
         # Detect background
         bg_color = self.image_processor.detect_background_color(image)
@@ -62,7 +65,7 @@ class DeepAnalyzer:
         
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        print(f"DEBUG: Found {len(contours)} contours")
+        logger.debug(f"DEBUG: Found {len(contours)} contours")
         
         # Extract detailed features (filter boundary objects for accurate metrics)
         features = []
@@ -104,10 +107,20 @@ class DeepAnalyzer:
             if shape_class == 'Fiber/Filament':  # Updated to grouped name
                 fiber_count += 1
             
-            # Extract color with full HSV
+            # Extract color from the particle's own crop (same approach as
+            # MLBenchmarkAnalyzer) instead of scanning the full frame per particle.
             particle_mask = np.zeros_like(mask)
             cv2.drawContours(particle_mask, [cnt], -1, 255, -1)
-            color_name, hue, sat, val = self.color_analyzer.extract_color_from_region(image, particle_mask)
+            # Crop from cnt's own bounding rect, not metrics['bounding_box']
+            # (computed from a simplified polygon that can be smaller than cnt
+            # and clip particle_mask pixels at the edge).
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            roi = image[by:by + bh, bx:bx + bw]
+            roi_mask = particle_mask[by:by + bh, bx:bx + bw]
+            if roi.size == 0 or roi_mask.size == 0:
+                color_name, hue, sat, val = self.color_analyzer.extract_color_from_region(image, particle_mask)
+            else:
+                color_name, hue, sat, val = self.color_analyzer.extract_color_from_region(roi, roi_mask)
             
             features.append({
                 'id': idx + 1,
@@ -130,7 +143,7 @@ class DeepAnalyzer:
         avg_time_per_object = processing_time / len(features) if features else 0
         
         if boundary_objects_removed > 0:
-            print(f"[Deep Analysis] Removed {boundary_objects_removed} boundary objects (touching edges)")
+            logger.info(f"[Deep Analysis] Removed {boundary_objects_removed} boundary objects (touching edges)")
         
         return AnalysisResult(
             features=features,

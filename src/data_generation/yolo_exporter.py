@@ -9,21 +9,21 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 import yaml
 
-from config.constants import SHAPE_CATEGORIES
+from config.constants import (
+    BENCHMARK_CANONICAL_CLASSES,
+    BENCHMARK_CLASS_ALIASES,
+    SHAPE_CATEGORIES,
+)
 
 
 class YOLODatasetExporter:
     """Export synthetic images and ground truth in YOLOv8 format"""
     
-    # Map individual shape names to grouped categories
-    SHAPE_TO_CATEGORY = {
-        'Microbead': 'Microbead/Pellet',
-        'Pellet': 'Microbead/Pellet',
-        'Fiber': 'Fiber/Filament',
-        'Filament': 'Fiber/Filament',
-        'Fragment': 'Fragment',
-        'Irregular': 'Irregular'
-    }
+    # 3-class canonical ontology matching benchmark and model
+    CANONICAL_CLASSES = list(BENCHMARK_CANONICAL_CLASSES)
+    
+    # Map individual shape names to grouped canonical categories
+    SHAPE_TO_CATEGORY = BENCHMARK_CLASS_ALIASES
     
     @staticmethod
     def get_class_id(shape_name: str) -> int:
@@ -34,16 +34,13 @@ class YOLODatasetExporter:
             shape_name: Individual shape name (e.g., 'Fiber', 'Microbead')
             
         Returns:
-            Class ID (0-4) corresponding to grouped category
+            Class ID (0-2) corresponding to canonical category
         """
-        # Map to grouped category
         category = YOLODatasetExporter.SHAPE_TO_CATEGORY.get(shape_name, 'Irregular')
-        
-        # Return index in SHAPE_CATEGORIES
         try:
-            return SHAPE_CATEGORIES.index(category)
+            return YOLODatasetExporter.CANONICAL_CLASSES.index(category)
         except ValueError:
-            return 4  # Default to 'Irregular' if not found
+            return 2  # Default to 'Irregular' if not found
     
     @staticmethod
     def ground_truth_to_yolo_bbox(particle: Dict, image_width: int, image_height: int) -> Tuple[int, float, float, float, float]:
@@ -54,7 +51,7 @@ class YOLODatasetExporter:
         All coordinates normalized to [0, 1]
         
         Args:
-            particle: Ground truth dict with 'shape', 'position', 'size', 'area'
+            particle: Ground truth dict with 'shape', 'bounding_box' or 'bbox_xywh', 'position', 'size', 'area'
             image_width: Image width in pixels
             image_height: Image height in pixels
             
@@ -65,44 +62,36 @@ class YOLODatasetExporter:
         shape_name = particle.get('shape', 'Irregular')
         class_id = YOLODatasetExporter.get_class_id(shape_name)
         
-        # Get position (center)
-        cx, cy = particle['position']
-        
-        # Estimate bounding box size from area
-        # For circles: area = π*r², so r = sqrt(area/π)
-        # For other shapes, use approximation
-        area = particle.get('area', 100)
-        
-        # Estimate radius/half-size from area
-        # For safety, add 20% margin to ensure full object is captured
-        estimated_radius = np.sqrt(area / np.pi) * 1.2
-        
-        # For elongated shapes (fibers/filaments), use size hint
-        size_hint = particle.get('size', estimated_radius)
-        
-        # Determine if shape is elongated
-        if 'Fiber' in shape_name or 'Filament' in shape_name:
-            # For fibers, width is small, height is length
-            bbox_width = max(size_hint * 0.3, 8)  # Minimum 8 pixels wide
-            bbox_height = size_hint * 1.2
+        # Check if exact mask-derived bounding box is available
+        bbox = particle.get('bbox_xywh') or particle.get('bounding_box')
+        if bbox is not None and len(bbox) == 4 and bbox[2] > 0 and bbox[3] > 0:
+            bx, by, bw, bh = bbox
+            x_center = bx + bw / 2.0
+            y_center = by + bh / 2.0
+            box_w = float(bw)
+            box_h = float(bh)
         else:
-            # For other shapes, use estimated radius
-            bbox_width = estimated_radius * 2
-            bbox_height = estimated_radius * 2
+            # Fallback estimation if mask bbox is not present
+            cx, cy = particle.get('position', (image_width / 2.0, image_height / 2.0))
+            area = particle.get('area', 100)
+            estimated_radius = np.sqrt(area / np.pi) * 1.2
+            size_hint = particle.get('size', estimated_radius)
+            if 'Fiber' in shape_name or 'Filament' in shape_name:
+                box_w = max(size_hint * 0.8, 12)
+                box_h = max(size_hint * 1.2, 12)
+            else:
+                box_w = estimated_radius * 2
+                box_h = estimated_radius * 2
+            x_center = cx
+            y_center = cy
         
-        # Normalize to [0, 1]
-        x_center_norm = cx / image_width
-        y_center_norm = cy / image_height
-        width_norm = bbox_width / image_width
-        height_norm = bbox_height / image_height
+        # Normalize to [0, 1] and clamp
+        x_center_norm = np.clip(x_center / image_width, 0.0, 1.0)
+        y_center_norm = np.clip(y_center / image_height, 0.0, 1.0)
+        width_norm = np.clip(box_w / image_width, 0.001, 1.0)
+        height_norm = np.clip(box_h / image_height, 0.001, 1.0)
         
-        # Clamp to valid range
-        x_center_norm = np.clip(x_center_norm, 0.0, 1.0)
-        y_center_norm = np.clip(y_center_norm, 0.0, 1.0)
-        width_norm = np.clip(width_norm, 0.01, 1.0)
-        height_norm = np.clip(height_norm, 0.01, 1.0)
-        
-        return class_id, x_center_norm, y_center_norm, width_norm, height_norm
+        return class_id, float(x_center_norm), float(y_center_norm), float(width_norm), float(height_norm)
     
     @staticmethod
     def save_yolo_annotation(annotation_path: Path, particles: List[Dict], image_width: int, image_height: int):
@@ -126,7 +115,7 @@ class YOLODatasetExporter:
     @staticmethod
     def save_detailed_ground_truth(ground_truth_path: Path, particles: List[Dict]):
         """
-        Save detailed ground truth information (like benchmark format).
+        Save detailed ground truth information (compliant with benchmark parser).
         
         Args:
             ground_truth_path: Path to save detailed ground truth .txt file
@@ -138,15 +127,21 @@ class YOLODatasetExporter:
             for i, particle in enumerate(particles, 1):
                 f.write(f"Particle {i}:\n")
                 f.write(f"  Shape: {particle.get('shape', 'Unknown')}\n")
-                f.write(f"  Color: {particle.get('color', 'Unknown')}\n")
+                f.write(f"  Color: {particle.get('color_label', particle.get('color', 'Unknown'))}\n")
                 
-                if 'wavelength' in particle and particle['wavelength']:
-                    f.write(f"  Wavelength: {particle['wavelength']}nm\n")
+                wavelength = particle.get('wavelength') or particle.get('wavelength_nm')
+                if wavelength:
+                    f.write(f"  Wavelength: {wavelength}nm\n")
                 
                 position = particle.get('position', (0, 0))
                 f.write(f"  Position: ({position[0]:.1f}, {position[1]:.1f})\n")
-                f.write(f"  Area: {particle.get('area', 0):.1f} px²\n")
-                f.write(f"  Size: {particle.get('size', 0):.1f} px\n")
+                
+                bbox = particle.get('bbox_xywh') or particle.get('bounding_box')
+                if bbox is not None and len(bbox) == 4:
+                    f.write(f"  Bounding Box: ({int(round(bbox[0]))}, {int(round(bbox[1]))}, {int(round(bbox[2]))}, {int(round(bbox[3]))})\n")
+                
+                f.write(f"  Area: {particle.get('area', 0):.2f} px2\n")
+                f.write(f"  Size: {particle.get('size', 0):.2f} px\n")
                 f.write("\n")
     
     @staticmethod
@@ -275,8 +270,8 @@ class YOLODatasetExporter:
             'train': train_images,  # Training images
             'val': val_images,      # Validation images
             'test': test_images,    # Test images (optional)
-            'nc': len(SHAPE_CATEGORIES),  # Number of classes
-            'names': SHAPE_CATEGORIES  # Class names
+            'nc': len(YOLODatasetExporter.CANONICAL_CLASSES),  # Number of classes
+            'names': YOLODatasetExporter.CANONICAL_CLASSES  # Class names
         }
         
         # Save as YAML
@@ -298,9 +293,9 @@ class YOLODatasetExporter:
             Dict with counts per class and split
         """
         stats = {
-            'train': {'total': 0, 'classes': {cat: 0 for cat in SHAPE_CATEGORIES}},
-            'val': {'total': 0, 'classes': {cat: 0 for cat in SHAPE_CATEGORIES}},
-            'test': {'total': 0, 'classes': {cat: 0 for cat in SHAPE_CATEGORIES}}
+            'train': {'total': 0, 'classes': {cat: 0 for cat in YOLODatasetExporter.CANONICAL_CLASSES}},
+            'val': {'total': 0, 'classes': {cat: 0 for cat in YOLODatasetExporter.CANONICAL_CLASSES}},
+            'test': {'total': 0, 'classes': {cat: 0 for cat in YOLODatasetExporter.CANONICAL_CLASSES}}
         }
         
         for split in ['train', 'val', 'test']:
@@ -317,8 +312,8 @@ class YOLODatasetExporter:
                         parts = line.strip().split()
                         if parts:
                             class_id = int(parts[0])
-                            if 0 <= class_id < len(SHAPE_CATEGORIES):
-                                class_name = SHAPE_CATEGORIES[class_id]
+                            if 0 <= class_id < len(YOLODatasetExporter.CANONICAL_CLASSES):
+                                class_name = YOLODatasetExporter.CANONICAL_CLASSES[class_id]
                                 stats[split]['classes'][class_name] += 1
         
         return stats

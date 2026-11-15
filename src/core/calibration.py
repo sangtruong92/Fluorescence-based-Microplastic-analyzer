@@ -14,9 +14,12 @@ Example usage:
     diameter = calib.calculate_real_diameter(particle_area_pixels)
 """
 
+import logging
 import numpy as np
 import json
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class CameraCalibration:
@@ -158,7 +161,7 @@ class CameraCalibration:
             self.um_per_pixel_y = calibration_factor
         
         self.is_calibrated = True
-        print(f"✓ Calibration complete: {calibration_factor:.3f} μm/pixel ({axis} axis)")
+        logger.info(f"✓ Calibration complete: {calibration_factor:.3f} μm/pixel ({axis} axis)")
     
     def calibrate_from_fov(self, fov_width_mm, fov_height_mm, image_width_px, image_height_px):
         """
@@ -174,9 +177,9 @@ class CameraCalibration:
         self.um_per_pixel_y = (fov_height_mm * 1000) / image_height_px
         self.is_calibrated = True
         
-        print(f"✓ Calibration from FOV:")
-        print(f"  X-axis: {self.um_per_pixel_x:.3f} μm/pixel")
-        print(f"  Y-axis: {self.um_per_pixel_y:.3f} μm/pixel")
+        logger.info(f"✓ Calibration from FOV:")
+        logger.debug(f"  X-axis: {self.um_per_pixel_x:.3f} μm/pixel")
+        logger.debug(f"  Y-axis: {self.um_per_pixel_y:.3f} μm/pixel")
     
     def calibrate_theoretical(self, sensor_width_mm, fov_degrees, working_distance_mm, 
                              resolution_width_px, aspect_ratio=16/9):
@@ -210,11 +213,11 @@ class CameraCalibration:
         self.um_per_pixel_y = (fov_height_mm * 1000) / resolution_height_px
         self.is_calibrated = True
         
-        print(f"✓ Theoretical calibration:")
-        print(f"  Focal length: {focal_length_mm:.2f} mm")
-        print(f"  FOV: {fov_width_mm:.2f} × {fov_height_mm:.2f} mm")
-        print(f"  X-axis: {self.um_per_pixel_x:.3f} μm/pixel")
-        print(f"  Y-axis: {self.um_per_pixel_y:.3f} μm/pixel")
+        logger.info(f"✓ Theoretical calibration:")
+        logger.debug(f"  Focal length: {focal_length_mm:.2f} mm")
+        logger.debug(f"  FOV: {fov_width_mm:.2f} × {fov_height_mm:.2f} mm")
+        logger.debug(f"  X-axis: {self.um_per_pixel_x:.3f} μm/pixel")
+        logger.debug(f"  Y-axis: {self.um_per_pixel_y:.3f} μm/pixel")
     
     def get_size_category(self, diameter_um):
         """
@@ -249,7 +252,7 @@ class CameraCalibration:
             dict: Updated dictionary with real-world measurements
         """
         if not self.is_calibrated:
-            print("⚠ Warning: Camera not calibrated. Using pixel values.")
+            logger.warning("⚠ Warning: Camera not calibrated. Using pixel values.")
             return features_dict
         
         # Create copy to avoid modifying original
@@ -303,7 +306,7 @@ class CameraCalibration:
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=4)
         
-        print(f"✓ Calibration saved to {filepath}")
+        logger.info(f"✓ Calibration saved to {filepath}")
     
     def load_calibration(self, filepath='calibration.json'):
         """
@@ -315,7 +318,7 @@ class CameraCalibration:
         filepath = Path(filepath)
         
         if not filepath.exists():
-            print(f"✗ Calibration file not found: {filepath}")
+            logger.warning(f"✗ Calibration file not found: {filepath}")
             return False
         
         with open(filepath, 'r') as f:
@@ -325,9 +328,9 @@ class CameraCalibration:
         self.um_per_pixel_y = data['um_per_pixel_y']
         self.is_calibrated = data['is_calibrated']
         
-        print(f"✓ Calibration loaded from {filepath}")
-        print(f"  X-axis: {self.um_per_pixel_x:.3f} μm/pixel")
-        print(f"  Y-axis: {self.um_per_pixel_y:.3f} μm/pixel")
+        logger.info(f"✓ Calibration loaded from {filepath}")
+        logger.debug(f"  X-axis: {self.um_per_pixel_x:.3f} μm/pixel")
+        logger.debug(f"  Y-axis: {self.um_per_pixel_y:.3f} μm/pixel")
         
         return True
     

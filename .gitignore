@@ -31,6 +31,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+*.code-workspace
 
 # Build artifacts
 *.spec
@@ -45,13 +46,14 @@ PARAMETER_REFERENCES_RESEARCH_GUIDE.md
 MORPHOMETRIC_PARAMETERS_REFERENCE.md
 
 # Data and Images
-benchmark_results/
-results/
+# benchmark_results/
+# results/
+runs/
 data/
 yolo_microplastic_dataset_v1/
 yolo_microplastic_dataset_v2/
-*.png
-*.jpg
+# *.png
+# *.jpg
 *.jpeg
 *.bmp
 *.tiff
@@ -67,3 +69,50 @@ Thumbs.db
 
 # Logs
 *.log
+
+yolo26m/
+
+.copilot-tracking/
+
+# Agent skill-installer artifacts (symlinks to .agents/skills/code-review/, not project files)
+skills-lock.json
+.adal/
+.agents/
+.aider-desk/
+.augment/
+.bob/
+.claude/
+.codeartsdoer/
+.codebuddy/
+.codemaker/
+.codestudio/
+.commandcode/
+.continue/
+.cortex/
+.crush/
+.devin/
+.forge/
+.goose/
+.hermes/
+.iflow/
+.junie/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.rovodev/
+.tabnine/
+.trae/
+.vibe/
+.windsurf/
+.zencoder/
+
+# Generated evaluation outputs (re-run anytime from evaluate_real_samples.py)
+UV_Filter_AloneFire_SV57/results/
+UV_Filter_AloneFire_SV57/results_v2/

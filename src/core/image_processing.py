@@ -10,11 +10,16 @@ from skimage import morphology, segmentation, measure, feature
 from skimage.segmentation import clear_border
 from typing import Tuple
 
+import logging
+
 from config.constants import (
     BG_WHITE_THRESHOLD,
     BG_BLACK_THRESHOLD,
     BG_STD_THRESHOLD
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ImageProcessor:
@@ -254,7 +259,7 @@ class ImageProcessor:
             if method == 'brightfield':
                 return ImageProcessor._preprocess_brightfield(img_bgr, min_size, **kwargs)
         except Exception as e:
-            print(f"ERROR in preprocessing ({method}): {str(e)}")
+            logger.error(f"ERROR in preprocessing ({method}): {str(e)}")
             return ImageProcessor._preprocess_basic(img_bgr, min_size, **kwargs)
         
         return ImageProcessor._preprocess_advanced(img_bgr, min_size, **kwargs)
@@ -299,7 +304,24 @@ class ImageProcessor:
             # Calculate threshold based on image statistics
             gray_mean = np.mean(gray)
             gray_std = np.std(gray)
-            thresh_val = max(gray_mean + gray_std * 1.5, 30)
+            # A fixed floor of 30 loses dim particles in low-light camera
+            # frames. Estimate the dark background from the image corners and
+            # use the upper tail of the frame when the whole image is dark.
+            if gray_mean < 30:
+                corner_pixels = np.concatenate([
+                    gray[:10, :10].ravel(),
+                    gray[:10, -10:].ravel(),
+                    gray[-10:, :10].ravel(),
+                    gray[-10:, -10:].ravel(),
+                ])
+                background_level = float(np.median(corner_pixels))
+                bright_tail = float(np.percentile(gray, 99.5))
+                thresh_val = max(
+                    background_level + 3,
+                    background_level + (bright_tail - background_level) * 0.35,
+                )
+            else:
+                thresh_val = max(gray_mean + gray_std * 1.5, 30)
             
             # Threshold to get bright particles
             _, binary = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
@@ -379,7 +401,7 @@ class ImageProcessor:
         channel_masks = []
         channel_weights = []  # Track channel importance
         
-        print(f"DEBUG Advanced: Processing RGB channels independently...")
+        logger.debug(f"DEBUG Advanced: Processing RGB channels independently...")
         
         for idx, (channel, name) in enumerate([(r_channel, 'Red'), (g_channel, 'Green'), (b_channel, 'Blue')]):
             # Check if channel has useful information
@@ -387,7 +409,7 @@ class ImageProcessor:
             channel_std = np.std(channel)
             
             if channel_range < 20 or channel_std < 5:
-                print(f"DEBUG Advanced: {name} channel has low variation, skipping")
+                logger.debug(f"DEBUG Advanced: {name} channel has low variation, skipping")
                 continue
             
             # CLAHE enhancement per channel for better contrast
@@ -421,24 +443,24 @@ class ImageProcessor:
             if detected_pixels > min_size * 2:
                 channel_masks.append(ch_mask)
                 channel_weights.append(detected_pixels)
-                print(f"DEBUG Advanced: {name} detected {detected_pixels} pixels")
+                logger.debug(f"DEBUG Advanced: {name} detected {detected_pixels} pixels")
         
         # === STEP 2: Intelligent channel combination ===
         if len(channel_masks) == 0:
-            print("DEBUG Advanced: No valid channels detected")
+            logger.debug("DEBUG Advanced: No valid channels detected")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             color_mask = np.zeros_like(gray)
         elif len(channel_masks) == 1:
             # Only one channel valid
             color_mask = channel_masks[0]
-            print("DEBUG Advanced: Using single channel")
+            logger.debug("DEBUG Advanced: Using single channel")
         else:
             # Multiple channels - use weighted combination
             # Strategy: OR operation to capture all particles from any channel
             color_mask = channel_masks[0]
             for mask in channel_masks[1:]:
                 color_mask = cv2.bitwise_or(color_mask, mask)
-            print(f"DEBUG Advanced: Combined {len(channel_masks)} channels")
+            logger.debug(f"DEBUG Advanced: Combined {len(channel_masks)} channels")
         
         # === STEP 3: Morphological refinement to remove noise ===
         # Use morphological operations to clean up the mask
@@ -469,7 +491,7 @@ class ImageProcessor:
         mask = cv2.dilate(mask, kernel_smooth, iterations=1)
         mask = cv2.erode(mask, kernel_smooth, iterations=1)
         
-        print(f"DEBUG Advanced: Final mask has {np.sum(mask > 0)} pixels")
+        logger.debug(f"DEBUG Advanced: Final mask has {np.sum(mask > 0)} pixels")
         return mask, 127
     
     @staticmethod
@@ -536,20 +558,20 @@ class ImageProcessor:
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         bg_color = ImageProcessor.detect_background_color(img_rgb)
         
-        print(f"DEBUG Watershed: Background={bg_color}, expected_diameter={expected_diameter}")
+        logger.debug(f"DEBUG Watershed: Background={bg_color}, expected_diameter={expected_diameter}")
         
         # === STEP 1: Channel selection (auto-select best channel) ===
         r_channel, g_channel, b_channel = cv2.split(img_rgb)
         # Heuristic: choose channel with highest contrast
         if np.mean(r_channel) > np.mean(g_channel) and np.mean(r_channel) > np.mean(b_channel):
             working_channel = r_channel
-            print("DEBUG Watershed: Using RED channel")
+            logger.debug("DEBUG Watershed: Using RED channel")
         elif np.std(g_channel) > np.std(r_channel):
             working_channel = g_channel
-            print("DEBUG Watershed: Using GREEN channel")
+            logger.debug("DEBUG Watershed: Using GREEN channel")
         else:
             working_channel = gray
-            print("DEBUG Watershed: Using GRAY channel")
+            logger.debug("DEBUG Watershed: Using GRAY channel")
         
         # === STEP 2: CLAHE enhancement ===
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -567,7 +589,7 @@ class ImageProcessor:
         background = cv2.morphologyEx(denoised, cv2.MORPH_OPEN, bg_kernel)
         foreground = cv2.subtract(denoised, background)
         
-        print(f"DEBUG Watershed: Background subtraction with kernel size {bg_kernel_size}")
+        logger.debug(f"DEBUG Watershed: Background subtraction with kernel size {bg_kernel_size}")
         
         # === STEP 5: Adaptive thresholding ===
         # Calculate block size from expected diameter
@@ -601,7 +623,7 @@ class ImageProcessor:
         basic_mask = (basic_mask * 255).astype(np.uint8)
         
         if np.sum(basic_mask > 0) == 0:
-            print("DEBUG Watershed: No objects detected after thresholding")
+            logger.debug("DEBUG Watershed: No objects detected after thresholding")
             return basic_mask, 127
         
         # === STEP 7: Distance transform ===
@@ -609,7 +631,7 @@ class ImageProcessor:
         max_dist = np.max(dist_transform)
         
         if max_dist == 0:
-            print("DEBUG Watershed: Distance transform is zero")
+            logger.debug("DEBUG Watershed: Distance transform is zero")
             return basic_mask, 127
         
         # === STEP 8: H-MAXIMA for marker detection (KEY IMPROVEMENT) ===
@@ -622,9 +644,9 @@ class ImageProcessor:
             # H-maxima suppresses peaks smaller than h_value
             h_maxima_result = sk_morph.h_maxima(dist_transform, h=h_value)
             markers, num_markers = ndi.label(h_maxima_result)
-            print(f"DEBUG Watershed: H-maxima (h={h_value}) found {num_markers} markers")
+            logger.debug(f"DEBUG Watershed: H-maxima (h={h_value}) found {num_markers} markers")
         except Exception as e:
-            print(f"DEBUG Watershed: H-maxima failed ({e}), using threshold fallback")
+            logger.debug(f"DEBUG Watershed: H-maxima failed ({e}), using threshold fallback")
             # Fallback to threshold-based markers
             thresh_value = int(max_dist * distance_thresh)
             markers = ndi.label(dist_transform > thresh_value)[0]
@@ -632,7 +654,7 @@ class ImageProcessor:
         
         # === STEP 9: Fallback if too few markers ===
         if num_markers < 2:
-            print(f"DEBUG Watershed: Too few markers ({num_markers}), using peak_local_max")
+            logger.debug(f"DEBUG Watershed: Too few markers ({num_markers}), using peak_local_max")
             try:
                 from skimage import feature
                 min_distance = max(1, int(0.5 * expected_diameter))
@@ -642,15 +664,15 @@ class ImageProcessor:
                     markers[tuple(coord)] = i
                 markers = ndi.label(markers > 0)[0]
                 num_markers = markers.max()
-                print(f"DEBUG Watershed: peak_local_max found {num_markers} markers")
+                logger.debug(f"DEBUG Watershed: peak_local_max found {num_markers} markers")
             except Exception as e:
-                print(f"DEBUG Watershed: peak_local_max failed ({e})")
+                logger.debug(f"DEBUG Watershed: peak_local_max failed ({e})")
                 return basic_mask, 127
         
         # === STEP 10: Apply watershed on negative distance ===
         labels = segmentation.watershed(-dist_transform, markers, mask=basic_mask > 0)
         
-        print(f"DEBUG Watershed: Watershed segmentation produced {labels.max()} regions")
+        logger.debug(f"DEBUG Watershed: Watershed segmentation produced {labels.max()} regions")
         
         # === STEP 11: Post-filter by properties (CRITICAL IMPROVEMENT) ===
         props = measure.regionprops(labels, intensity_image=foreground)
@@ -697,11 +719,11 @@ class ImageProcessor:
             mask[region_mask] = 255
             valid_regions += 1
         
-        print(f"DEBUG Watershed: Kept {valid_regions} valid regions after filtering")
+        logger.debug(f"DEBUG Watershed: Kept {valid_regions} valid regions after filtering")
         
         # === STEP 12: Fallback if no valid regions ===
         if np.sum(mask > 0) == 0:
-            print("DEBUG Watershed: No valid regions, using basic mask")
+            logger.debug("DEBUG Watershed: No valid regions, using basic mask")
             mask = basic_mask
         
         return mask, 127
@@ -850,7 +872,7 @@ class ImageProcessor:
         adaptive_c = kwargs.get('adaptive_c_value', 2)
         expected_max_diam = kwargs.get('expected_max_diameter', 200)  # particle size estimate
         
-        print(f"DEBUG Adaptive: Processing RGB channels with background subtraction...")
+        logger.debug(f"DEBUG Adaptive: Processing RGB channels with background subtraction...")
         
         # CLAHE for contrast enhancement
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -874,7 +896,7 @@ class ImageProcessor:
         for idx, (channel, name) in enumerate([(r_channel, 'Red'), (g_channel, 'Green'), (b_channel, 'Blue')]):
             # Check channel validity
             if np.std(channel) < 5:
-                print(f"DEBUG Adaptive: {name} channel low variation, skipping")
+                logger.debug(f"DEBUG Adaptive: {name} channel low variation, skipping")
                 continue
             
             # === STEP 1.1: Contrast enhancement ===
@@ -901,7 +923,7 @@ class ImageProcessor:
             else:
                 # BRIGHTFIELD: Use STRICTER adaptive threshold
                 if np.max(ch_denoised) < 10:
-                    print(f"DEBUG Adaptive: {name} channel too dark after bg subtraction")
+                    logger.debug(f"DEBUG Adaptive: {name} channel too dark after bg subtraction")
                     continue
                 
                 # Increase C parameter for stricter thresholding
@@ -925,11 +947,11 @@ class ImageProcessor:
             detected_pixels = np.sum(ch_mask > 0)
             if detected_pixels > min_size * 2:
                 channel_masks.append(ch_mask)
-                print(f"DEBUG Adaptive: {name} detected {detected_pixels} pixels")
+                logger.debug(f"DEBUG Adaptive: {name} detected {detected_pixels} pixels")
         
         # === STEP 2: Combine RGB channel results ===
         if len(channel_masks) == 0:
-            print("DEBUG Adaptive: No valid channels, using grayscale fallback with bg subtraction")
+            logger.debug("DEBUG Adaptive: No valid channels, using grayscale fallback with bg subtraction")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             gray_enhanced = clahe.apply(gray)
             
@@ -956,7 +978,7 @@ class ImageProcessor:
             mask = channel_masks[0]
             for ch_mask in channel_masks[1:]:
                 mask = cv2.bitwise_or(mask, ch_mask)
-            print(f"DEBUG Adaptive: Combined {len(channel_masks)} channel masks")
+            logger.debug(f"DEBUG Adaptive: Combined {len(channel_masks)} channel masks")
         
         # === STEP 3: Conservative morphological refinement - AVOID EXPANSION ===
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))  # Smaller kernel (was 3x3)
@@ -985,7 +1007,7 @@ class ImageProcessor:
         # Removed final dilation to prevent area expansion
         # Original boundaries are now preserved for accurate area measurements
         
-        print(f"DEBUG Adaptive: Final mask has {np.sum(final_mask > 0)} pixels")
+        logger.debug(f"DEBUG Adaptive: Final mask has {np.sum(final_mask > 0)} pixels")
         return final_mask, 127
 
     # =========================================================================
@@ -1015,7 +1037,7 @@ class ImageProcessor:
         Returns:
             tuple: (binary_mask, threshold_value)
         """
-        print("DEBUG Brightfield Basic: Starting brightfield-optimized detection...")
+        logger.debug("DEBUG Brightfield Basic: Starting brightfield-optimized detection...")
         
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
@@ -1032,7 +1054,7 @@ class ImageProcessor:
         # Very low threshold - white background has S near 0
         s_thresh = 12
         _, sat_mask = cv2.threshold(s_enhanced, s_thresh, 255, cv2.THRESH_BINARY)
-        print(f"DEBUG Brightfield Basic: Saturation threshold={s_thresh}, detected={np.sum(sat_mask>0)} pixels")
+        logger.debug(f"DEBUG Brightfield Basic: Saturation threshold={s_thresh}, detected={np.sum(sat_mask>0)} pixels")
         
         # === Strategy 2: RGB channel difference (specific colors) ===
         r, g, b = cv2.split(img_rgb)
@@ -1062,7 +1084,7 @@ class ImageProcessor:
         color_mask = cv2.bitwise_or(color_mask, blue_mask)
         color_mask = cv2.bitwise_or(color_mask, green_mask)
         color_mask = cv2.bitwise_or(color_mask, dark_colored)
-        print(f"DEBUG Brightfield Basic: Color channel mask detected={np.sum(color_mask>0)} pixels")
+        logger.debug(f"DEBUG Brightfield Basic: Color channel mask detected={np.sum(color_mask>0)} pixels")
         
         # === Strategy 3: Value-based detection (dark particles) ===
         # Invert value channel - dark particles become bright
@@ -1071,7 +1093,7 @@ class ImageProcessor:
         
         # Otsu threshold on inverted value
         _, val_mask = cv2.threshold(v_blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        print(f"DEBUG Brightfield Basic: Value mask detected={np.sum(val_mask>0)} pixels")
+        logger.debug(f"DEBUG Brightfield Basic: Value mask detected={np.sum(val_mask>0)} pixels")
         
         # === Combine all strategies ===
         combined = cv2.bitwise_or(sat_mask, color_mask)
@@ -1093,7 +1115,7 @@ class ImageProcessor:
         else:
             mask = filled
         
-        print(f"DEBUG Brightfield Basic: Final mask has {np.sum(mask > 0)} pixels")
+        logger.debug(f"DEBUG Brightfield Basic: Final mask has {np.sum(mask > 0)} pixels")
         return mask, int(s_thresh)
     
     @staticmethod
@@ -1120,7 +1142,7 @@ class ImageProcessor:
         Returns:
             tuple: (binary_mask, threshold_value)
         """
-        print("DEBUG Brightfield Advanced: Starting multi-strategy detection...")
+        logger.debug("DEBUG Brightfield Advanced: Starting multi-strategy detection...")
         
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1143,7 +1165,7 @@ class ImageProcessor:
         
         if np.sum(sat_mask > 0) > min_size * 2:
             masks.append(sat_mask)
-            print(f"DEBUG Brightfield: Saturation detected {np.sum(sat_mask>0)} pixels (thresh={s_thresh})")
+            logger.debug(f"DEBUG Brightfield: Saturation detected {np.sum(sat_mask>0)} pixels (thresh={s_thresh})")
         
         # === Strategy 2: Color difference from background ===
         # Sample background color from corners (should be white/light gray)
@@ -1156,7 +1178,7 @@ class ImageProcessor:
             img_rgb[h-corner_size:, w-corner_size:]
         ]
         bg_color = np.mean([np.mean(c, axis=(0,1)) for c in corners], axis=0).astype(np.float32)
-        print(f"DEBUG Brightfield: Detected background color RGB={bg_color}")
+        logger.debug(f"DEBUG Brightfield: Detected background color RGB={bg_color}")
         
         img_float = img_rgb.astype(np.float32)
         
@@ -1172,7 +1194,7 @@ class ImageProcessor:
             
             if np.sum(diff_mask > 0) > min_size * 2:
                 masks.append(diff_mask)
-                print(f"DEBUG Brightfield: Color diff detected {np.sum(diff_mask>0)} pixels")
+                logger.debug(f"DEBUG Brightfield: Color diff detected {np.sum(diff_mask>0)} pixels")
         
         # === Strategy 3: LAB color space (perceptual difference) ===
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -1191,7 +1213,7 @@ class ImageProcessor:
         
         if np.sum(ab_mask > 0) > min_size * 2:
             masks.append(ab_mask)
-            print(f"DEBUG Brightfield: LAB detected {np.sum(ab_mask>0)} pixels")
+            logger.debug(f"DEBUG Brightfield: LAB detected {np.sum(ab_mask>0)} pixels")
         
         # === Strategy 4: Specific color channel detection ===
         # For red particles: high R, low G and B
@@ -1228,7 +1250,7 @@ class ImageProcessor:
         
         if np.sum(color_channel_mask > 0) > min_size * 2:
             masks.append(color_channel_mask)
-            print(f"DEBUG Brightfield: RGB channel detected {np.sum(color_channel_mask>0)} pixels")
+            logger.debug(f"DEBUG Brightfield: RGB channel detected {np.sum(color_channel_mask>0)} pixels")
         
         # === Strategy 5: Grayscale intensity (dark particles) ===
         gray_inverted = 255 - gray
@@ -1239,11 +1261,11 @@ class ImageProcessor:
         # Only use if not too much detected (avoid false positives from texture)
         if np.sum(gray_mask > 0) > min_size * 2 and np.sum(gray_mask > 0) < gray_mask.size * 0.3:
             masks.append(gray_mask)
-            print(f"DEBUG Brightfield: Grayscale detected {np.sum(gray_mask>0)} pixels")
+            logger.debug(f"DEBUG Brightfield: Grayscale detected {np.sum(gray_mask>0)} pixels")
         
         # === Combine all strategies ===
         if len(masks) == 0:
-            print("DEBUG Brightfield: No strategy worked, using fallback")
+            logger.debug("DEBUG Brightfield: No strategy worked, using fallback")
             # Fallback: simple saturation threshold
             _, combined = cv2.threshold(s_channel, 10, 255, cv2.THRESH_BINARY)
         elif len(masks) == 1:
@@ -1253,11 +1275,11 @@ class ImageProcessor:
             combined = masks[0]
             for m in masks[1:]:
                 combined = cv2.bitwise_or(combined, m)
-            print(f"DEBUG Brightfield: Combined {len(masks)} strategies with OR")
+            logger.debug(f"DEBUG Brightfield: Combined {len(masks)} strategies with OR")
             
             # If result is too large (>30% of image), use intersection for refinement
             if np.sum(combined > 0) > combined.size * 0.3:
-                print("DEBUG Brightfield: Too many detections, using AND intersection")
+                logger.debug("DEBUG Brightfield: Too many detections, using AND intersection")
                 combined = masks[0]
                 for m in masks[1:]:
                     combined = cv2.bitwise_and(combined, m)
@@ -1282,7 +1304,7 @@ class ImageProcessor:
         else:
             final_mask = filled
         
-        print(f"DEBUG Brightfield Advanced: Final mask has {np.sum(final_mask > 0)} pixels")
+        logger.debug(f"DEBUG Brightfield Advanced: Final mask has {np.sum(final_mask > 0)} pixels")
         return final_mask, 127
     
     @staticmethod
@@ -1308,7 +1330,7 @@ class ImageProcessor:
         Returns:
             tuple: (binary_mask, threshold_value)
         """
-        print("DEBUG Brightfield Watershed: Starting watershed segmentation...")
+        logger.debug("DEBUG Brightfield Watershed: Starting watershed segmentation...")
         
         distance_thresh = kwargs.get('distance_thresh', 0.5)
         
@@ -1316,7 +1338,7 @@ class ImageProcessor:
         basic_mask, _ = ImageProcessor._preprocess_brightfield(img, min_size, **kwargs)
         
         if np.sum(basic_mask > 0) == 0:
-            print("DEBUG Brightfield Watershed: No objects detected in basic mask")
+            logger.debug("DEBUG Brightfield Watershed: No objects detected in basic mask")
             return basic_mask, 127
         
         # === Distance transform ===
@@ -1324,7 +1346,7 @@ class ImageProcessor:
         max_dist = np.max(dist_transform)
         
         if max_dist == 0:
-            print("DEBUG Brightfield Watershed: Distance transform is zero")
+            logger.debug("DEBUG Brightfield Watershed: Distance transform is zero")
             return basic_mask, 127
         
         # === Find markers using h-maxima ===
@@ -1335,21 +1357,21 @@ class ImageProcessor:
             from skimage import morphology as sk_morph
             h_maxima_result = sk_morph.h_maxima(dist_transform, h=h_value)
             markers, num_markers = ndi.label(h_maxima_result)
-            print(f"DEBUG Brightfield Watershed: H-maxima found {num_markers} markers")
+            logger.debug(f"DEBUG Brightfield Watershed: H-maxima found {num_markers} markers")
         except Exception as e:
-            print(f"DEBUG Brightfield Watershed: H-maxima failed ({e}), using threshold")
+            logger.debug(f"DEBUG Brightfield Watershed: H-maxima failed ({e}), using threshold")
             thresh_value = int(max_dist * distance_thresh)
             markers = ndi.label(dist_transform > thresh_value)[0]
             num_markers = markers.max()
         
         if num_markers < 2:
-            print("DEBUG Brightfield Watershed: Too few markers, returning basic mask")
+            logger.debug("DEBUG Brightfield Watershed: Too few markers, returning basic mask")
             return basic_mask, 127
         
         # === Apply watershed ===
         labels = segmentation.watershed(-dist_transform, markers, mask=basic_mask > 0)
         
-        print(f"DEBUG Brightfield Watershed: Watershed produced {labels.max()} regions")
+        logger.debug(f"DEBUG Brightfield Watershed: Watershed produced {labels.max()} regions")
         
         # === Filter regions by properties ===
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1372,7 +1394,7 @@ class ImageProcessor:
             mask[region_mask] = 255
             valid_count += 1
         
-        print(f"DEBUG Brightfield Watershed: Kept {valid_count} valid regions")
+        logger.debug(f"DEBUG Brightfield Watershed: Kept {valid_count} valid regions")
         
         if np.sum(mask > 0) == 0:
             return basic_mask, 127
