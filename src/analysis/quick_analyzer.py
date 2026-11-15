@@ -3,6 +3,7 @@ Analysis Module - Quick Analyzer
 Fast analysis for real-time processing
 """
 
+import logging
 import cv2
 import numpy as np
 import time
@@ -10,6 +11,8 @@ from typing import List, Dict
 
 from config.settings import PreprocessingParams, AnalysisResult
 from src.core import ImageProcessor, ShapeAnalyzer, ColorAnalyzer
+
+logger = logging.getLogger(__name__)
 
 
 class QuickAnalyzer:
@@ -95,10 +98,20 @@ class QuickAnalyzer:
             # Classify shape
             shape_class = self.shape_analyzer.classify_shape_unified(metrics)
             
-            # Extract color
+            # Extract color from the particle's own crop (same approach as
+            # MLBenchmarkAnalyzer) instead of scanning the full frame per particle.
             particle_mask = np.zeros_like(mask)
             cv2.drawContours(particle_mask, [cnt], -1, 255, -1)
-            color_name, hue, sat, val = self.color_analyzer.extract_color_from_region(image, particle_mask)
+            # Crop from cnt's own bounding rect, not metrics['bounding_box']
+            # (computed from a simplified polygon that can be smaller than cnt
+            # and clip particle_mask pixels at the edge).
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            roi = image[by:by + bh, bx:bx + bw]
+            roi_mask = particle_mask[by:by + bh, bx:bx + bw]
+            if roi.size == 0 or roi_mask.size == 0:
+                color_name, hue, sat, val = self.color_analyzer.extract_color_from_region(image, particle_mask)
+            else:
+                color_name, hue, sat, val = self.color_analyzer.extract_color_from_region(roi, roi_mask)
             
             features.append({
                 'id': idx + 1,
@@ -116,7 +129,7 @@ class QuickAnalyzer:
         processing_time = time.time() - start_time
         
         if boundary_objects_removed > 0:
-            print(f"[Quick Analysis] Removed {boundary_objects_removed} boundary objects (touching edges)")
+            logger.info(f"[Quick Analysis] Removed {boundary_objects_removed} boundary objects (touching edges)")
         
         return AnalysisResult(
             features=features,

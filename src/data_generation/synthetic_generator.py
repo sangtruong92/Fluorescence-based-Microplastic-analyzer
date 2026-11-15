@@ -132,15 +132,17 @@ class SyntheticImageGenerator:
                 shape_label, height, width, min_margin
             )
             
-            # Calculate circularity from the mask for ground truth
+            # Calculate circularity and bounding box from the mask for ground truth
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             circularity = 0.0
+            bx, by, bw, bh = (int(cx - size_hint), int(cy - size_hint), int(size_hint * 2), int(size_hint * 2))
             if contours:
                 cnt = max(contours, key=cv2.contourArea)
                 perimeter = cv2.arcLength(cnt, True)
                 if perimeter > 0:
                     circularity = (4.0 * np.pi * area) / (perimeter ** 2)
                     circularity = min(circularity, 1.0)
+                bx, by, bw, bh = cv2.boundingRect(cnt)
             
             # Apply effects
             mask_float = self._apply_effects(mask, params)
@@ -167,6 +169,8 @@ class SyntheticImageGenerator:
             ground_truth.append({
                 'id': i + 1,
                 'position': (cx, cy),
+                'bounding_box': (bx, by, bw, bh),
+                'bbox_xywh': [float(bx), float(by), float(bw), float(bh)],
                 'size': size_hint,
                 'area': area,
                 'circularity': circularity,

@@ -93,6 +93,27 @@ SHAPE_GROUP_MAPPING = {
     'Irregular': 'Irregular'
 }
 
+# Benchmark-only detection ontology. Keep this separate from the legacy shape
+# grouping above because the trained YOLO model has exactly three classes.
+BENCHMARK_CANONICAL_CLASSES = (
+    'Microbead/Pellet',
+    'Fiber/Filament',
+    'Irregular',
+)
+
+BENCHMARK_CLASS_ALIASES = {
+    'Microbead': 'Microbead/Pellet',
+    'Pellet': 'Microbead/Pellet',
+    'Microbead/Pellet': 'Microbead/Pellet',
+    'Fiber': 'Fiber/Filament',
+    'Filament': 'Fiber/Filament',
+    'Fiber/Filament': 'Fiber/Filament',
+    'Fragment': 'Irregular',
+    'Irregular': 'Irregular',
+}
+
+BENCHMARK_EVALUATION_IOU_THRESHOLD = 0.50
+
 # ============================================================================
 # COLOR CLASSIFICATION
 # ============================================================================

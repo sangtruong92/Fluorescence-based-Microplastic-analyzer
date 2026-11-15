@@ -9,11 +9,20 @@ Cross-platform compatible: Works on Windows, macOS, and Linux.
 
 import sys
 import argparse
+import logging
+import os
 import platform
 from pathlib import Path
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Library code logs via logging (not print); default to INFO, override with
+# LOG_LEVEL=DEBUG to see the detailed segmentation/calibration traces.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 def get_platform_info():

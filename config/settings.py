@@ -57,6 +57,8 @@ class AnalysisResult:
     fiber_count: int = 0
     avg_processing_per_object: float = 0.0
     boundary_objects_removed: int = 0  # Count of objects touching image edges (excluded from analysis)
+    raw_detections: List[Dict[str, Any]] = field(default_factory=list)
+    rejected_detections: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

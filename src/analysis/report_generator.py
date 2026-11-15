@@ -5,6 +5,7 @@ Creates interactive HTML reports with charts for benchmark results
 
 import os
 import json
+import html as html_module
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Any
@@ -26,6 +27,16 @@ class ReportGenerator:
     def __init__(self):
         """Initialize report generator"""
         self.template = self._load_template()
+
+    @staticmethod
+    def _format_optional(value, decimals=2):
+        return 'N/A' if value is None else f'{float(value):.{decimals}f}'
+
+    @staticmethod
+    def _metric_class(value):
+        if value is None:
+            return ''
+        return 'good' if value >= 0.8 else ('medium' if value >= 0.5 else 'bad')
     
     def generate_benchmark_report(self, benchmark_results: Dict[str, Any], 
                                   output_path: str) -> str:
@@ -133,12 +144,13 @@ class ReportGenerator:
         recalls = []
         f1_scores = []
         
-        for name, metrics in [('Quick', quick), ('Deep', deep), ('Watershed', watershed), ('ML Benchmark', ml)]:
-            if metrics and 'precision' in metrics:
+        metric_sources = [('Quick', quick), ('Deep', deep), ('Watershed', watershed), ('ML Benchmark', ml)]
+        for name, metrics in metric_sources:
+            if metrics and all(metrics.get(key) is not None for key in ('precision', 'recall', 'f1_score')):
                 methods.append(name)
-                precisions.append(metrics.get('precision', 0))
-                recalls.append(metrics.get('recall', 0))
-                f1_scores.append(metrics.get('f1_score', 0))
+                precisions.append(metrics['precision'])
+                recalls.append(metrics['recall'])
+                f1_scores.append(metrics['f1_score'])
         
         if not methods:
             return ""
@@ -167,13 +179,16 @@ class ReportGenerator:
             ax1.text(i + width, f + 0.02, f'{f:.2f}', ha='center', va='bottom', fontsize=9)
         
         # Detection counts
-        detected = [metrics.get('detected', 0) for metrics in [quick, deep, watershed, ml] if metrics]
-        ground_truth = deep.get('ground_truth', 0) if deep else 0
+        count_sources = [(name, metrics) for name, metrics in metric_sources if metrics]
+        count_methods = [name for name, _ in count_sources]
+        detected = [metrics.get('detected', 0) for _, metrics in count_sources]
+        ground_truth = deep.get('ground_truth') if deep else None
         
         if detected:
-            ax2.bar(methods, detected, color='#9C27B0', alpha=0.8, label='Detected')
-            ax2.axhline(y=ground_truth, color='red', linestyle='--', linewidth=2, 
-                       label=f'Ground Truth: {ground_truth}')
+            ax2.bar(count_methods, detected, color='#9C27B0', alpha=0.8, label='Detected')
+            if ground_truth is not None:
+                ax2.axhline(y=ground_truth, color='red', linestyle='--', linewidth=2,
+                           label=f'Ground Truth: {ground_truth:.1f}')
             ax2.set_xlabel('Analysis Method', fontsize=12, fontweight='bold')
             ax2.set_ylabel('Particle Count', fontsize=12, fontweight='bold')
             ax2.set_title('Detection Count Comparison', fontsize=14, fontweight='bold')
@@ -200,12 +215,7 @@ class ReportGenerator:
         all_shapes_set = set(list(quick_shapes.keys()) + list(deep_shapes.keys()) + list(ml_shapes.keys()) + list(gt_shapes.keys()))
         
         # Define logical grouping order - related categories placed together
-        preferred_order = [
-            'Fiber', 'Fiber/Filament', 'Filament',  # Fiber group
-            'Fragment',  # Fragment
-            'Irregular',  # Irregular
-            'Microbead', 'Microbead/Pellet', 'Pellet'  # Bead group
-        ]
+        preferred_order = ['Microbead/Pellet', 'Fiber/Filament', 'Irregular', 'Unknown']
         
         # Place shapes in preferred order, then add any remaining shapes
         all_shapes = [s for s in preferred_order if s in all_shapes_set]
@@ -235,7 +245,7 @@ class ReportGenerator:
         
         ax.set_xlabel('Shape Type', fontsize=12, fontweight='bold')
         ax.set_ylabel('Count', fontsize=12, fontweight='bold')
-        ax.set_title('Shape Distribution: Quick vs Deep vs ML vs Ground Truth', fontsize=14, fontweight='bold')
+        ax.set_title('Canonical Detection-Class Distribution (3 classes)', fontsize=14, fontweight='bold')
         ax.set_xticks(x)
         ax.set_xticklabels(all_shapes, rotation=45, ha='right')
         ax.legend(fontsize=11)
@@ -343,7 +353,7 @@ class ReportGenerator:
         
         ax.set_xlabel('Color', fontsize=12, fontweight='bold')
         ax.set_ylabel('Count', fontsize=12, fontweight='bold')
-        ax.set_title('Color Distribution: Quick vs Deep vs ML vs Ground Truth', fontsize=14, fontweight='bold')
+        ax.set_title('ROI Color Post-processing Distribution (includes Unknown)', fontsize=14, fontweight='bold')
         ax.set_xticks(x)
         ax.set_xticklabels(all_colors, rotation=45, ha='right')
         ax.legend(handles=legend_elements, fontsize=11)
@@ -420,7 +430,7 @@ class ReportGenerator:
             
             ax.set_xlabel('Area (pixels²)', fontsize=12, fontweight='bold')
             ax.set_ylabel('Frequency', fontsize=12, fontweight='bold')
-            ax.set_title('Object Pixel Area Distribution: Quick vs Deep vs ML vs Ground Truth', fontsize=14, fontweight='bold')
+            ax.set_title('Unmatched Descriptive Pixel-Area Distributions', fontsize=14, fontweight='bold')
             ax.legend(fontsize=10, loc='best')
             ax.grid(True, alpha=0.3, axis='y')
         
@@ -781,9 +791,9 @@ class ReportGenerator:
                     <div class="label">Avg Particles per Image</div>
                     {boundary_info}
                     <div style="margin-top: 10px;">
-                        <span class="metric">Precision: {precision:.2f}</span>
-                        <span class="metric">Recall: {recall:.2f}</span>
-                        <span class="metric">F1: {f1:.2f}</span>
+                        <span class="metric">Precision: {self._format_optional(precision)}</span>
+                        <span class="metric">Recall: {self._format_optional(recall)}</span>
+                        <span class="metric">F1: {self._format_optional(f1)}</span>
                     </div>
                 </div>
 """
@@ -801,10 +811,10 @@ class ReportGenerator:
         
         # Add batch summary section
         if num_images > 1:
-            total_quick = quick_data.get('detected', 0) * num_images
-            total_deep = deep_data.get('detected', 0) * num_images
-            total_ml = ml_data.get('detected', 0) * num_images if ml_data else 0
-            total_gt = ground_truth * num_images
+            total_quick = quick_data.get('detected_total', quick_data.get('detected', 0) * num_images)
+            total_deep = deep_data.get('detected_total', deep_data.get('detected', 0) * num_images)
+            total_ml = ml_data.get('detected_total', ml_data.get('detected', 0) * num_images) if ml_data else 0
+            total_gt = results.get('total_ground_truth', ground_truth * num_images)
             
             ml_summary = f"""
                         <li><strong>ML Benchmark:</strong> ~{total_ml:.0f} particles total ({ml_data.get('detected', 0):.1f} avg per image)</li>
@@ -821,9 +831,27 @@ class ReportGenerator:
                         {ml_summary}<li><strong>Ground Truth:</strong> ~{total_gt:.0f} particles total ({ground_truth:.1f} avg per image)</li>
                     </ul>
                     <p style="margin-top: 15px; color: #666;">
-                        <em>Note: The precision, recall, and F1 scores shown are calculated by aggregating 
-                        true positives, false positives, and false negatives across all images.</em>
+                        <em>Precision, recall and F1 use class-aware, one-to-one bounding-box matching;
+                        count agreement is retained only in the JSON evidence as a legacy diagnostic.</em>
                     </p>
+                </div>
+            </div>
+"""
+
+        evaluation_method = results.get('evaluation_method', {})
+        if evaluation_method:
+            unavailable = evaluation_method.get('unavailable_reasons') or []
+            reason_html = ''.join(f'<li>{html_module.escape(str(reason))}</li>' for reason in unavailable)
+            html += f"""
+            <div class="section">
+                <h2>Evaluation Contract</h2>
+                <div style="background:#fff8e1;padding:20px;border-radius:10px;border-left:5px solid #ff9800;">
+                    <p><strong>Detection metric:</strong> class-aware one-to-one bbox matching</p>
+                    <p><strong>Matching:</strong> confidence-descending greedy</p>
+                    <p><strong>IoU threshold:</strong> {evaluation_method.get('iou_threshold', 'N/A')}</p>
+                    <p><strong>Classes:</strong> {', '.join(evaluation_method.get('classes', []))}</p>
+                    <p><strong>Status:</strong> {evaluation_method.get('availability', 'unknown')}</p>
+                    {f'<ul>{reason_html}</ul>' if reason_html else ''}
                 </div>
             </div>
 """
@@ -851,12 +879,26 @@ class ReportGenerator:
 """
         
         if 'color_comparison' in charts and charts['color_comparison']:
+            coverage_rows = []
+            for label, data in [('Quick', quick_data), ('Deep', deep_data), ('ML', ml_data)]:
+                coverage = data.get('color_coverage') if data else None
+                evaluated = data.get('color_evaluated_count') if data else None
+                total = data.get('detected_total') if data else None
+                coverage_rows.append(
+                    f"<li><strong>{label}:</strong> {self._format_optional(coverage, 3)} "
+                    f"({evaluated if evaluated is not None else 'N/A'} / "
+                    f"{total if total is not None else 'N/A'})</li>"
+                )
             html += f"""
             <div class="section">
                 <h2>🎨 Color Distribution Comparison (Quick vs Deep vs ML vs Ground Truth)</h2>
                 <div class="chart-container">
                     <img src="{charts['color_comparison']}" alt="Color Distribution Comparison">
                 </div>
+                <p><strong>ROI color post-processing coverage</strong>
+                (evaluated detections / detector outputs):</p>
+                <ul>{''.join(coverage_rows)}</ul>
+                <p><em>Unknown is retained. This is not a YOLO color-classification metric.</em></p>
             </div>
 """
         
@@ -866,6 +908,35 @@ class ReportGenerator:
                 <h2>📏 Object Pixel Area Distribution Comparison (Quick vs Deep vs ML vs Ground Truth)</h2>
                 <div class="chart-container">
                     <img src="{charts['area_comparison']}" alt="Area Distribution Comparison">
+                </div>
+            </div>
+"""
+
+        matched_rows = []
+        for label, data in [('Quick', quick_data), ('Deep', deep_data), ('ML', ml_data)]:
+            attrs = (data or {}).get('matched_attributes') or {}
+            color_attrs = attrs.get('color') or {}
+            area_attrs = attrs.get('area') or {}
+            matched_rows.append(
+                f"<li><strong>{label}:</strong> color accuracy "
+                f"{self._format_optional(color_attrs.get('accuracy'), 3)} "
+                f"({color_attrs.get('matched_pairs', 0)} matched pairs); "
+                f"area ratio median {self._format_optional(area_attrs.get('ratio_median'), 3)}, "
+                f"mean {self._format_optional(area_attrs.get('ratio_mean'), 3)} "
+                f"({area_attrs.get('matched_pairs', 0)} matched pairs)</li>"
+            )
+        if any((data or {}).get('available') for data in [quick_data, deep_data, ml_data]):
+            html += f"""
+            <div class="section">
+                <h2>🎯 Object-matched Color and Area Accuracy</h2>
+                <div style="background:#f0f8ff;padding:20px;border-radius:10px;border-left:5px solid #4CAF50;">
+                    <p>Unlike the distribution charts above, these numbers compare each prediction
+                    directly against the exact ground-truth particle it was matched to
+                    (same class, IoU &gt;= {evaluation_method.get('iou_threshold', 'N/A')}),
+                    so they measure per-object accuracy, not aggregate counts.</p>
+                    <ul>{''.join(matched_rows)}</ul>
+                    <p><em>Area ratio is predicted area / ground-truth area; 1.0 means an exact match.
+                    A class with few matched pairs produces a less reliable ratio.</em></p>
                 </div>
             </div>
 """
@@ -930,17 +1001,17 @@ class ReportGenerator:
                 f1 = method_data.get('f1_score', 0)
                 time_val = method_data.get('processing_time', 0)
                 
-                precision_class = 'good' if precision >= 0.8 else ('medium' if precision >= 0.5 else 'bad')
-                recall_class = 'good' if recall >= 0.8 else ('medium' if recall >= 0.5 else 'bad')
-                f1_class = 'good' if f1 >= 0.8 else ('medium' if f1 >= 0.5 else 'bad')
+                precision_class = self._metric_class(precision)
+                recall_class = self._metric_class(recall)
+                f1_class = self._metric_class(f1)
                 
                 html += f"""
                         <tr>
                             <td><strong>{method_name}</strong></td>
                             <td>{detected}</td>
-                            <td class="{precision_class}">{precision:.3f}</td>
-                            <td class="{recall_class}">{recall:.3f}</td>
-                            <td class="{f1_class}">{f1:.3f}</td>
+                            <td class="{precision_class}">{self._format_optional(precision, 3)}</td>
+                            <td class="{recall_class}">{self._format_optional(recall, 3)}</td>
+                            <td class="{f1_class}">{self._format_optional(f1, 3)}</td>
                             <td>{time_val:.2f}s</td>
                         </tr>
 """
@@ -949,6 +1020,33 @@ class ReportGenerator:
                     </tbody>
                 </table>
             </div>
+"""
+
+        ml_per_class = ml_data.get('per_class', {}) if ml_data else {}
+        if ml_per_class:
+            html += """
+            <div class="section">
+                <h2>ML Detection Metrics by Class</h2>
+                <table>
+                    <thead><tr><th>Class</th><th>GT</th><th>Predicted</th><th>TP</th><th>FP</th><th>FN</th><th>Precision</th><th>Recall</th><th>F1</th></tr></thead>
+                    <tbody>
+"""
+            for class_name, class_data in ml_per_class.items():
+                html += f"""
+                    <tr><td><strong>{html_module.escape(str(class_name))}</strong></td>
+                    <td>{class_data.get('ground_truth_count', 0)}</td><td>{class_data.get('prediction_count', 0)}</td>
+                    <td>{class_data.get('true_positives', 0)}</td><td>{class_data.get('false_positives', 0)}</td><td>{class_data.get('false_negatives', 0)}</td>
+                    <td>{self._format_optional(class_data.get('precision'), 3)}</td>
+                    <td>{self._format_optional(class_data.get('recall'), 3)}</td>
+                    <td>{self._format_optional(class_data.get('f1_score'), 3)}</td></tr>
+"""
+            html += """
+                    </tbody>
+                </table>
+            </div>
+"""
+
+        html += """
         </div>
         
         <footer>

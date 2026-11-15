@@ -3,14 +3,30 @@ Main Window - Microplastic Analyzer GUI
 Complete GUI implementation using modular components
 """
 
+from src.ml import YOLO_AVAILABLE, YOLO
+from src.gui.calibration_dialog import CameraCalibrationDialog
+from src.core.calibration import CameraCalibration
+from src.data_generation import SyntheticImageGenerator
+from src.analysis import QuickAnalyzer, DeepAnalyzer, MLBenchmarkAnalyzer, StatisticsComparator
+from config.constants import SHAPE_GROUP_MAPPING
+from config.settings import PreprocessingParams, SyntheticImageParams
+from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import sys
 import platform
+import logging
 import cv2
 import numpy as np
 import json
+import os
 from pathlib import Path
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
 from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QTextEdit,
                              QComboBox, QSpinBox, QGroupBox, QTabWidget,
                              QTableWidget, QTableWidgetItem, QProgressBar,
@@ -20,20 +36,11 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage
 import matplotlib
 matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
 
-from config.settings import PreprocessingParams, SyntheticImageParams
-from config.constants import SHAPE_GROUP_MAPPING
-from src.analysis import QuickAnalyzer, DeepAnalyzer, MLBenchmarkAnalyzer, StatisticsComparator
-from src.data_generation import SyntheticImageGenerator
-from src.core.calibration import CameraCalibration
-from src.gui.calibration_dialog import CameraCalibrationDialog
+
+logger = logging.getLogger(__name__)
 
 # Machine Learning imports - handle PyTorch compatibility issues
-import sys
-from src.ml import YOLO_AVAILABLE, YOLO
 
 # Build detailed error message for UI
 YOLO_ERROR_MESSAGE = ""
@@ -58,62 +65,81 @@ def map_to_grouped_shape(shape_name: str) -> str:
     """
     Map individual shape names to grouped categories.
     Handles legacy individual names from ground truth data.
-    
+
     Args:
         shape_name: Individual or grouped shape name
-        
+
     Returns:
         Grouped shape name
     """
     return SHAPE_GROUP_MAPPING.get(shape_name, shape_name)
 
 
-def _get_camera_backend() -> int:
-    """
-    Get the appropriate OpenCV camera backend for the current OS.
-    
-    Returns:
-        OpenCV camera backend constant:
-        - cv2.CAP_AVFOUNDATION: macOS (AVFoundation framework)
-        - cv2.CAP_DSHOW: Windows (DirectShow)
-        - cv2.CAP_V4L2: Linux (Video4Linux2)
-    """
+def _get_camera_backends() -> list[int]:
+    """Return camera backends to try, with OpenCV's automatic choice last."""
     system = platform.system()
-    
     if system == 'Darwin':
-        # macOS uses AVFoundation
-        return cv2.CAP_AVFOUNDATION
+        preferred_backends = [cv2.CAP_AVFOUNDATION]
     elif system == 'Windows':
-        # Windows uses DirectShow
-        return cv2.CAP_DSHOW
+        preferred_backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW]
     else:
-        # Linux and other Unix-like systems use Video4Linux2
-        return cv2.CAP_V4L2
+        preferred_backends = [cv2.CAP_V4L2]
+
+    return [*preferred_backends, cv2.CAP_ANY]
+
+
+def _get_available_usb_cameras() -> list[tuple[int, str]]:
+    """Find available cameras on platforms that use OpenCV device indices."""
+    available_cameras = []
+    for camera_id in range(3):
+        cap = _open_camera_capture(camera_id)
+        if cap is not None:
+            available_cameras.append((camera_id, f"Camera {camera_id}"))
+            cap.release()
+
+    return available_cameras
+
+
+def _open_camera_capture(camera_id: int):
+    """Open a camera using supported backends without blocking on a frame read."""
+    for backend in _get_camera_backends():
+        cap = None
+        try:
+            cap = cv2.VideoCapture(camera_id, backend)
+            if cap.isOpened():
+                return cap
+        except cv2.error:
+            pass
+
+        if cap is not None:
+            cap.release()
+
+    return None
 
 
 class AnalysisThread(QThread):
     """Background thread for image analysis"""
     finished = pyqtSignal(object)
     progress = pyqtSignal(str)
-    
+
     def __init__(self, image, params, analysis_type='quick'):
         super().__init__()
         self.image = image
         self.params = params
         self.analysis_type = analysis_type
-        
+
     def run(self):
         try:
             self.progress.emit("Analyzing image...")
-            
+
             if self.analysis_type == 'quick':
                 analyzer = QuickAnalyzer()
             else:
                 analyzer = DeepAnalyzer()
-            
+
             result = analyzer.analyze(self.image, self.params)
             self.finished.emit(result)
-            
+
         except Exception as e:
             self.progress.emit(f"Error: {str(e)}")
             self.finished.emit(None)
@@ -121,15 +147,17 @@ class AnalysisThread(QThread):
 
 class ImageLabel(QLabel):
     """Custom label for displaying images with zoom support"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(400, 300)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("border: 2px solid #ccc; background-color: #f0f0f0;")
+        self.setStyleSheet(
+            "border: 2px solid #ccc; background-color: #f0f0f0;")
         self.setText("No Image Loaded")
         self.setMouseTracking(True)
         self.setScaledContents(False)
-        
+
         # Zoom state
         self.zoom_factor = 1.0
         self.original_pixmap = None
@@ -141,46 +169,48 @@ class ImageLabel(QLabel):
         self.zoom_box_start = None
         self.zoom_box_enabled = False
         self.parent_scroll = None
-        
+
         # Rubber band for zoom box
-        self.rubber_band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self)
-        
+        self.rubber_band = QtWidgets.QRubberBand(
+            QtWidgets.QRubberBand.Rectangle, self)
+
     def set_scroll_area(self, scroll_area):
         """Set parent scroll area for proper sizing"""
         self.parent_scroll = scroll_area
-        
+
     def set_image(self, image):
         """Display numpy array as image"""
         if image is None:
             return
-            
+
         # Store original image
         self.original_image = image.copy()
-        
+
         # Convert to RGB if needed
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         elif image.shape[2] == 4:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
-        
+
         # Convert to QImage
         h, w, ch = image.shape
         bytes_per_line = ch * w
-        qt_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        
+        qt_image = QImage(image.data, w, h, bytes_per_line,
+                          QImage.Format_RGB888)
+
         # Store original pixmap
         self.original_pixmap = QPixmap.fromImage(qt_image)
         self.zoom_factor = 1.0
         self.update_display()
-        
+
     def update_display(self):
         """Update the displayed image with current zoom"""
         if self.original_pixmap is None:
             return
-        
+
         # Use zoomed region if available, otherwise use full original
         display_pixmap = self.zoomed_pixmap if self.zoomed_pixmap else self.original_pixmap
-            
+
         if self.zoom_factor == 1.0:
             # At 100% zoom, fit to available space in scroll area
             if self.parent_scroll:
@@ -188,49 +218,53 @@ class ImageLabel(QLabel):
                 # Leave some margin
                 available_size.setWidth(available_size.width() - 10)
                 available_size.setHeight(available_size.height() - 10)
-                scaled = display_pixmap.scaled(available_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                scaled = display_pixmap.scaled(
+                    available_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             else:
-                scaled = display_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            
+                scaled = display_pixmap.scaled(
+                    self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
             self.setPixmap(scaled)
             self.resize(scaled.size())
         else:
             # Apply zoom - show at original size * zoom factor
             new_size = display_pixmap.size() * self.zoom_factor
-            scaled = display_pixmap.scaled(new_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled = display_pixmap.scaled(
+                new_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.setPixmap(scaled)
             self.resize(scaled.size())
-            
+
     def zoom_in(self):
         """Zoom in by 20%"""
         self.zoom_factor *= 1.2
         self.update_display()
-        
+
     def zoom_out(self):
         """Zoom out by 20%"""
         self.zoom_factor /= 1.2
         if self.zoom_factor < 1.0:
             self.zoom_factor = 1.0
         self.update_display()
-        
+
     def reset_zoom(self):
         """Reset zoom to 100% and show full original image"""
         self.zoom_factor = 1.0
         self.zoom_region = None
         self.zoomed_pixmap = None
         self.update_display()
-        
+
     def enable_zoom_box(self, enabled):
         """Enable/disable zoom box selection"""
         self.zoom_box_enabled = enabled
         self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
-        
+
     def mousePressEvent(self, event):
         """Handle mouse press for zoom and pan"""
         if self.zoom_box_enabled and event.button() == Qt.LeftButton:
             # Start zoom box
             self.zoom_box_start = event.pos()
-            self.rubber_band.setGeometry(QtCore.QRect(self.zoom_box_start, QtCore.QSize()))
+            self.rubber_band.setGeometry(QtCore.QRect(
+                self.zoom_box_start, QtCore.QSize()))
             self.rubber_band.show()
         elif event.button() == Qt.MiddleButton:
             # Start panning
@@ -240,23 +274,25 @@ class ImageLabel(QLabel):
         elif self.zoom_box_enabled and event.button() == Qt.RightButton:
             # Right click to zoom out
             self.zoom_out()
-            
+
     def mouseMoveEvent(self, event):
         """Handle mouse move for zoom box and pan"""
         if self.zoom_box_start is not None:
             # Update rubber band
-            self.rubber_band.setGeometry(QtCore.QRect(self.zoom_box_start, event.pos()).normalized())
+            self.rubber_band.setGeometry(QtCore.QRect(
+                self.zoom_box_start, event.pos()).normalized())
         elif self.is_panning and self.last_mouse_pos is not None:
             # Pan the image (would need scroll area support)
             self.last_mouse_pos = event.pos()
-            
+
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
         if event.button() == Qt.LeftButton and self.zoom_box_start is not None:
             # Complete zoom box
             self.rubber_band.hide()
-            zoom_rect = QtCore.QRect(self.zoom_box_start, event.pos()).normalized()
-            
+            zoom_rect = QtCore.QRect(
+                self.zoom_box_start, event.pos()).normalized()
+
             if zoom_rect.width() > 10 and zoom_rect.height() > 10 and self.original_pixmap:
                 # Convert screen coordinates to image coordinates
                 current_pixmap = self.pixmap()
@@ -264,32 +300,36 @@ class ImageLabel(QLabel):
                     # Calculate scaling factor from displayed image to original
                     scale_x = self.original_pixmap.width() / current_pixmap.width()
                     scale_y = self.original_pixmap.height() / current_pixmap.height()
-                    
+
                     # Convert zoom box to original image coordinates
                     img_x = int(zoom_rect.x() * scale_x)
                     img_y = int(zoom_rect.y() * scale_y)
                     img_w = int(zoom_rect.width() * scale_x)
                     img_h = int(zoom_rect.height() * scale_y)
-                    
+
                     # Clamp to image bounds
-                    img_x = max(0, min(img_x, self.original_pixmap.width() - 1))
-                    img_y = max(0, min(img_y, self.original_pixmap.height() - 1))
+                    img_x = max(
+                        0, min(img_x, self.original_pixmap.width() - 1))
+                    img_y = max(
+                        0, min(img_y, self.original_pixmap.height() - 1))
                     img_w = min(img_w, self.original_pixmap.width() - img_x)
                     img_h = min(img_h, self.original_pixmap.height() - img_y)
-                    
+
                     # Crop the region from original image
                     if img_w > 10 and img_h > 10:
                         self.zoom_region = (img_x, img_y, img_w, img_h)
-                        cropped = self.original_pixmap.copy(img_x, img_y, img_w, img_h)
+                        cropped = self.original_pixmap.copy(
+                            img_x, img_y, img_w, img_h)
                         self.zoomed_pixmap = cropped
                         self.zoom_factor = 1.0  # Reset zoom factor for the cropped region
                         self.update_display()
-                    
+
             self.zoom_box_start = None
         elif event.button() == Qt.MiddleButton:
             self.is_panning = False
-            self.setCursor(Qt.CrossCursor if self.zoom_box_enabled else Qt.ArrowCursor)
-            
+            self.setCursor(
+                Qt.CrossCursor if self.zoom_box_enabled else Qt.ArrowCursor)
+
     def wheelEvent(self, event):
         """Handle mouse wheel for zoom"""
         if event.modifiers() & Qt.ControlModifier:
@@ -299,7 +339,7 @@ class ImageLabel(QLabel):
             else:
                 self.zoom_out()
             event.accept()
-            
+
     def resizeEvent(self, event):
         """Handle resize to update display at zoom 1.0"""
         super().resizeEvent(event)
@@ -309,7 +349,7 @@ class ImageLabel(QLabel):
 
 class MicroplasticAnalyzerGUI(QMainWindow):
     """Main GUI window for Microplastic Analyzer"""
-    
+
     def __init__(self):
         super().__init__()
         self.current_image = None
@@ -319,7 +359,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.esp_camera_ip = "192.168.1.100"  # Default ESP32-CAM IP
         self.yolo_model = None
         self.yolo_model_path = None
-        
+
         # Camera calibration
         self.calibration = CameraCalibration()
         # Try to load existing calibration
@@ -327,215 +367,246 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             self.calibration.load_calibration('calibration.json')
         except:
             pass  # No calibration file yet
-        
+
         # Statistics comparator for multi-method comparison
         self.stats_comparator = StatisticsComparator()
         self.quick_result = None
         self.deep_result = None
         self.ml_result = None
-        
+
         self.initUI()
-        
+        self._load_default_yolo_model()
+
     def initUI(self):
         """Initialize the user interface"""
         self.setWindowTitle('Microplastic Analyzer Pro')
         self.setGeometry(100, 100, 1400, 900)
-        
+
         # Create central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        
+
         # Left panel - Controls
         left_panel = self.create_control_panel()
         main_layout.addWidget(left_panel, 1)
-        
+
         # Right panel - Display
         right_panel = self.create_display_panel()
         main_layout.addWidget(right_panel, 2)
-        
+
         # Status bar
         self.statusBar().showMessage('Ready')
-        
+
         # Menu bar
         self.create_menu_bar()
-        
+
     def create_menu_bar(self):
         """Create menu bar"""
         menubar = self.menuBar()
-        
+
         # File menu
         file_menu = menubar.addMenu('File')
-        
+
         open_action = QtWidgets.QAction('Open Image', self)
         open_action.setShortcut('Ctrl+O')
         open_action.triggered.connect(self.load_image)
         file_menu.addAction(open_action)
-        
+
         save_action = QtWidgets.QAction('Save Results', self)
         save_action.setShortcut('Ctrl+S')
         save_action.triggered.connect(self.save_results)
         file_menu.addAction(save_action)
-        
+
+        # save image
+        # save_action = QtWidgets.QAction('save Image', self)
+        save_image = QtWidgets.QAction('Save image', self)
+        save_image.setShortcut('Ctrl+I')
+        save_image.triggered.connect(self.save_camera_image)
+        file_menu.addAction(save_image)
+        # end "save function"
+
+        # save analysis of image
+        save_annotated_action = QtWidgets.QAction('Save Annotated Image', self)
+        save_annotated_action.setShortcut('Ctrl+Shift+S')
+        save_annotated_action.triggered.connect(self.save_annotated_image)
+        file_menu.addAction(save_annotated_action)
+
         file_menu.addSeparator()
-        
+
         exit_action = QtWidgets.QAction('Exit', self)
         exit_action.setShortcut('Ctrl+Q')
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
-        
+
         # Tools menu
         tools_menu = menubar.addMenu('Tools')
-        
+
         generate_action = QtWidgets.QAction('Generate Synthetic Data', self)
         generate_action.triggered.connect(self.generate_synthetic)
         tools_menu.addAction(generate_action)
-        
+
         # Machine Learning menu
         ml_menu = menubar.addMenu('Machine Learning')
-        
+
         load_model_action = QtWidgets.QAction('Load YOLO Model', self)
         load_model_action.triggered.connect(self.load_yolo_model)
         ml_menu.addAction(load_model_action)
-        
+
         run_ml_action = QtWidgets.QAction('Run ML Detection', self)
         run_ml_action.triggered.connect(self.run_yolo_detection)
         ml_menu.addAction(run_ml_action)
-        
+
         # Help menu
         help_menu = menubar.addMenu('Help')
-        
+
         about_action = QtWidgets.QAction('About', self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
-        
+
         # Add keyboard shortcuts for zoom (working on any tab)
         from PyQt5.QtWidgets import QShortcut
         from PyQt5.QtGui import QKeySequence
-        
+
         # Shortcuts for Annotated view (when active)
         zoom_in_shortcut = QShortcut(QKeySequence('+'), self)
-        zoom_in_shortcut.activated.connect(lambda: self.zoom_in_annotated() if self.tabs.currentIndex() == 2 else self.zoom_in_image())
-        
+        zoom_in_shortcut.activated.connect(lambda: self.zoom_in_annotated(
+        ) if self.tabs.currentIndex() == 2 else self.zoom_in_image())
+
         zoom_out_shortcut = QShortcut(QKeySequence('-'), self)
-        zoom_out_shortcut.activated.connect(lambda: self.zoom_out_annotated() if self.tabs.currentIndex() == 2 else self.zoom_out_image())
-        
+        zoom_out_shortcut.activated.connect(lambda: self.zoom_out_annotated(
+        ) if self.tabs.currentIndex() == 2 else self.zoom_out_image())
+
         reset_zoom_shortcut = QShortcut(QKeySequence('0'), self)
-        reset_zoom_shortcut.activated.connect(lambda: self.reset_zoom_annotated() if self.tabs.currentIndex() == 2 else self.reset_zoom_image())
-        
+        reset_zoom_shortcut.activated.connect(lambda: self.reset_zoom_annotated(
+        ) if self.tabs.currentIndex() == 2 else self.reset_zoom_image())
+
     def create_control_panel(self):
         """Create left control panel with comprehensive parameter controls"""
         panel = QWidget()
         main_layout = QVBoxLayout(panel)
-        
+
         # Create scroll area for parameters
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
         layout = QVBoxLayout(scroll_content)
-        
+
         # Title
         title = QLabel("Microplastic Analyzer Pro")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; padding: 10px;")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: bold; padding: 10px;")
         layout.addWidget(title)
-        
+
         # ESP Camera button
         esp_cam_btn = QPushButton("Capture from Camera")
-        esp_cam_btn.setStyleSheet("padding: 10px; font-size: 14px; font-weight: bold; background-color: #2196F3;")
-        esp_cam_btn.setToolTip("Capture image from USB Camera or ESP32-CAM.\nSupports direct USB connection or network HTTP capture.")
+        esp_cam_btn.setStyleSheet(
+            "padding: 10px; font-size: 14px; font-weight: bold; background-color: #2196F3;")
+        esp_cam_btn.setToolTip(
+            "Capture image from USB Camera or ESP32-CAM.\nSupports direct USB connection or network HTTP capture.")
         esp_cam_btn.clicked.connect(self.capture_from_esp_camera)
         layout.addWidget(esp_cam_btn)
-        
+
         # Load Image button
         load_btn = QPushButton("Load Image")
-        load_btn.setStyleSheet("padding: 10px; font-size: 14px; font-weight: bold; background-color: #4CAF50;")
+        load_btn.setStyleSheet(
+            "padding: 10px; font-size: 14px; font-weight: bold; background-color: #4CAF50;")
         load_btn.clicked.connect(self.load_image)
         layout.addWidget(load_btn)
-        
+
         # Camera Calibration button
         calibrate_btn = QPushButton("📐 Camera Calibration")
-        calibrate_btn.setStyleSheet("padding: 10px; font-size: 14px; font-weight: bold; background-color: #9C27B0; color: white;")
+        calibrate_btn.setStyleSheet(
+            "padding: 10px; font-size: 14px; font-weight: bold; background-color: #9C27B0; color: white;")
         calibrate_btn.setToolTip("Calibrate camera to measure real-world particle sizes.\n"
-                                "Input camera parameters or use reference object.")
+                                 "Input camera parameters or use reference object.")
         calibrate_btn.clicked.connect(self.open_calibration_dialog)
         layout.addWidget(calibrate_btn)
-        
+
         # Calibration status label
         self.calibration_status = QLabel("⚠ Not calibrated - sizes in pixels")
         if self.calibration.is_calibrated:
-            self.calibration_status.setText(f"✓ Calibrated: {self.calibration.um_per_pixel_x:.3f} μm/pixel")
-            self.calibration_status.setStyleSheet("color: green; font-weight: bold;")
+            self.calibration_status.setText(
+                f"✓ Calibrated: {self.calibration.um_per_pixel_x:.3f} μm/pixel")
+            self.calibration_status.setStyleSheet(
+                "color: green; font-weight: bold;")
         else:
-            self.calibration_status.setStyleSheet("color: orange; font-weight: bold;")
+            self.calibration_status.setStyleSheet(
+                "color: orange; font-weight: bold;")
         layout.addWidget(self.calibration_status)
-        
+
         # Generate Synthetic Image button
         generate_btn = QPushButton("Generate Synthetic Image")
-        generate_btn.setStyleSheet("padding: 10px; font-size: 14px; font-weight: bold; background-color: #FF9800;")
+        generate_btn.setStyleSheet(
+            "padding: 10px; font-size: 14px; font-weight: bold; background-color: #FF9800;")
         generate_btn.setToolTip("Generate a single synthetic image with automatic ground truth.\n"
-                               "Perfect for testing and comparing analysis methods.")
+                                "Perfect for testing and comparing analysis methods.")
         generate_btn.clicked.connect(self.generate_synthetic_single)
         layout.addWidget(generate_btn)
-        
+
         # Export YOLO Dataset button
         yolo_export_btn = QPushButton("Export YOLO Training Dataset")
-        yolo_export_btn.setStyleSheet("padding: 10px; font-size: 14px; font-weight: bold; background-color: #9C27B0; color: white;")
+        yolo_export_btn.setStyleSheet(
+            "padding: 10px; font-size: 14px; font-weight: bold; background-color: #9C27B0; color: white;")
         yolo_export_btn.setToolTip("Generate and export synthetic images in YOLOv8 format.\n"
                                    "Creates images/ and labels/ folders with annotations\n"
                                    "for training custom YOLOv8 detection models.")
         yolo_export_btn.clicked.connect(self.export_yolo_dataset)
         layout.addWidget(yolo_export_btn)
-        
+
         # ===== SYNTHETIC IMAGE GENERATION PARAMETERS =====
         # (Moved here from below, right after Generate button)
         synth_group = QGroupBox("Synthetic Image Parameters")
         synth_layout = QGridLayout()
-        
+
         # Row 1: Basic parameters
         synth_layout.addWidget(QLabel("Num Particles:"), 0, 0)
         self.synth_num_particles = QSpinBox()
         self.synth_num_particles.setRange(1, 100)
         self.synth_num_particles.setValue(50)
         synth_layout.addWidget(self.synth_num_particles, 0, 1)
-        
+
         synth_layout.addWidget(QLabel("Shape Type:"), 0, 2)
         self.synth_shape_type = QComboBox()
-        self.synth_shape_type.addItems(['Mixed', 'Fiber/Filament only', 'Fragment only', 
+        self.synth_shape_type.addItems(['Mixed', 'Fiber/Filament only', 'Fragment only',
                                        'Microbead/Pellet only', 'Irregular only'])
         synth_layout.addWidget(self.synth_shape_type, 0, 3)
-        
+
         # Row 2: Color and blur
         synth_layout.addWidget(QLabel("Color Type:"), 1, 0)
         self.synth_color_type = QComboBox()
-        self.synth_color_type.addItems(['Fluorescent', 'Natural', 'Mixed Colors'])
+        self.synth_color_type.addItems(
+            ['Fluorescent', 'Natural', 'Mixed Colors'])
         synth_layout.addWidget(self.synth_color_type, 1, 1)
-        
+
         self.synth_enable_blur = QCheckBox("Enable Blur")
         self.synth_enable_blur.setChecked(True)
         synth_layout.addWidget(self.synth_enable_blur, 1, 2)
-        
+
         synth_layout.addWidget(QLabel("Blur Kernel:"), 1, 3)
         self.synth_blur_kernel = QSpinBox()
         self.synth_blur_kernel.setRange(1, 31)
         self.synth_blur_kernel.setValue(15)
         self.synth_blur_kernel.setSingleStep(2)
         synth_layout.addWidget(self.synth_blur_kernel, 1, 4)
-        
+
         # Row 3: Background and Particle Brightness
         synth_layout.addWidget(QLabel("BG Brightness:"), 2, 0)
         self.synth_brightness = QSpinBox()
         self.synth_brightness.setRange(0, 255)
         self.synth_brightness.setValue(0)
-        self.synth_brightness.setToolTip("Background brightness:\n• 0 = Dark (fluorescent microscopy)\n• 255 = White (brightfield microscopy)")
+        self.synth_brightness.setToolTip(
+            "Background brightness:\n• 0 = Dark (fluorescent microscopy)\n• 255 = White (brightfield microscopy)")
         synth_layout.addWidget(self.synth_brightness, 2, 1)
-        
+
         synth_layout.addWidget(QLabel("Objects Brightness:"), 2, 2)
         self.synth_particle_brightness = QSpinBox()
         self.synth_particle_brightness.setRange(0, 255)
         self.synth_particle_brightness.setValue(255)
-        self.synth_particle_brightness.setToolTip("Particle/object brightness:\n• 255 = Full brightness\n• 128 = Half brightness\n• Lower values = darker particles")
+        self.synth_particle_brightness.setToolTip(
+            "Particle/object brightness:\n• 255 = Full brightness\n• 128 = Half brightness\n• Lower values = darker particles")
         synth_layout.addWidget(self.synth_particle_brightness, 2, 3)
-        
+
         # Row 4: Image dimensions (compact)
         synth_layout.addWidget(QLabel("Size:"), 3, 0)
         self.synth_width = QSpinBox()
@@ -547,10 +618,10 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.synth_height.setRange(100, 5000)
         self.synth_height.setValue(1280)
         synth_layout.addWidget(self.synth_height, 3, 3)
-        
+
         synth_group.setLayout(synth_layout)
         layout.addWidget(synth_group)
-        
+
         # Create hidden parameters with default values (not shown in UI for simplicity)
         self.synth_enable_glow = QCheckBox()
         self.synth_enable_glow.setChecked(True)
@@ -564,62 +635,65 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.synth_bg_noise_min.setValue(0.0)
         self.synth_bg_noise_max = QDoubleSpinBox()
         self.synth_bg_noise_max.setValue(0.02)
-        
+
         # ===== QUICK ANALYSIS PARAMETERS =====
         quick_group = QGroupBox("Quick Analysis Parameters")
         quick_layout = QGridLayout()
-        
+
         # Row 1: Blur and Distance Threshold
         # Row 0: Preprocess Method
         quick_layout.addWidget(QLabel("Preprocess:"), 0, 0)
         self.quick_method = QComboBox()
-        self.quick_method.addItems(['basic'])  # Quick: only basic method
+        self.quick_method.addItems(['basic', 'adaptive'])
         self.quick_method.setCurrentIndex(0)  # Default to 'basic'
         self.quick_method.setToolTip(
             "Quick Analysis Method:\n"
-            "• basic: Simple Otsu thresholding (fastest)"
+            "• basic: Simple thresholding (fastest)\n"
+            "• adaptive: Background subtraction for uneven or fluorescent images"
         )
         quick_layout.addWidget(self.quick_method, 0, 1, 1, 3)
-        
+
         # Row 1: Blur and Distance Threshold
         quick_layout.addWidget(QLabel("Blur:"), 1, 0)
         self.quick_blur = QSpinBox()
         self.quick_blur.setRange(3, 100)
         self.quick_blur.setValue(5)
         quick_layout.addWidget(self.quick_blur, 1, 1)
-        
+
         quick_layout.addWidget(QLabel("Distance Threshold:"), 1, 2)
         self.quick_distance_thresh = QDoubleSpinBox()
         self.quick_distance_thresh.setRange(0.1, 1.0)
         self.quick_distance_thresh.setSingleStep(0.1)
         self.quick_distance_thresh.setValue(0.5)
         quick_layout.addWidget(self.quick_distance_thresh, 1, 3)
-        
+
         # Row 2: Min and Max Area
         quick_layout.addWidget(QLabel("Min Area:"), 2, 0)
         self.quick_min_area = QSpinBox()
         self.quick_min_area.setRange(1, 100000)
         self.quick_min_area.setValue(20)
         quick_layout.addWidget(self.quick_min_area, 2, 1)
-        
+
         quick_layout.addWidget(QLabel("Max Area:"), 2, 2)
         self.quick_max_area = QSpinBox()
         self.quick_max_area.setRange(1, 100000)
         self.quick_max_area.setValue(10000)
         quick_layout.addWidget(self.quick_max_area, 2, 3)
-        
+
         quick_group.setLayout(quick_layout)
         layout.addWidget(quick_group)
-        
+
         # ===== DEEP ANALYSIS PARAMETERS =====
         deep_group = QGroupBox("Deep Analysis Parameters")
         deep_layout = QGridLayout()
-        
+
         # Row 0: Preprocess Method
         deep_layout.addWidget(QLabel("Preprocess:"), 0, 0)
         self.deep_method = QComboBox()
-        self.deep_method.addItems(['adaptive', 'advanced', 'watershed'])  # Deep: 3 methods
-        self.deep_method.setCurrentIndex(1)  # Default to 'advanced' (auto-detects background)
+        self.deep_method.addItems(
+            ['adaptive', 'advanced', 'watershed'])  # Deep: 3 methods
+        # Default to 'advanced' (auto-detects background)
+        self.deep_method.setCurrentIndex(1)
         self.deep_method.setToolTip(
             "Deep Analysis Methods:\n"
             "• adaptive: CLAHE + local threshold (fluorescent)\n"
@@ -627,7 +701,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             "• watershed: Separates touching particles"
         )
         deep_layout.addWidget(self.deep_method, 0, 1, 1, 3)
-        
+
         # Row 1: Morphology Kernel and Blur
         deep_layout.addWidget(QLabel("Morphology Kernel:"), 1, 0)
         self.deep_marker_size = QSpinBox()
@@ -640,13 +714,13 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             "• Larger (4-5): More conservative separation"
         )
         deep_layout.addWidget(self.deep_marker_size, 1, 1)
-        
+
         deep_layout.addWidget(QLabel("Blur:"), 1, 2)
         self.deep_blur = QSpinBox()
         self.deep_blur.setRange(1, 100)
         self.deep_blur.setValue(3)
         deep_layout.addWidget(self.deep_blur, 1, 3)
-        
+
         # Row 2: Distance Threshold and Min Area
         deep_layout.addWidget(QLabel("Distance Threshold:"), 2, 0)
         self.deep_distance_thresh = QDoubleSpinBox()
@@ -660,367 +734,424 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             "• Higher (0.6-0.7): Conservative separation"
         )
         deep_layout.addWidget(self.deep_distance_thresh, 2, 1)
-        
+
         deep_layout.addWidget(QLabel("Min Area:"), 2, 2)
         self.deep_min_area = QSpinBox()
         self.deep_min_area.setRange(1, 100000)
         self.deep_min_area.setValue(20)
         deep_layout.addWidget(self.deep_min_area, 2, 3)
-        
+
         # Row 3: Max Area
         deep_layout.addWidget(QLabel("Max Area:"), 3, 0)
         self.deep_max_area = QSpinBox()
         self.deep_max_area.setRange(1, 100000)
         self.deep_max_area.setValue(10000)
         deep_layout.addWidget(self.deep_max_area, 3, 1)
-        
+
         # Row 4: Brightness and Sharpness thresholds
         deep_layout.addWidget(QLabel("Min Brightness:"), 4, 0)
         self.brightness_threshold = QSpinBox()
         self.brightness_threshold.setRange(0, 255)
         self.brightness_threshold.setValue(0)
-        self.brightness_threshold.setToolTip("Minimum brightness (0=disabled, 20-80 typical)")
+        self.brightness_threshold.setToolTip(
+            "Minimum brightness (0=disabled, 20-80 typical)")
         deep_layout.addWidget(self.brightness_threshold, 4, 1)
-        
+
         deep_layout.addWidget(QLabel("Min Sharpness:"), 4, 2)
         self.min_blur_score = QDoubleSpinBox()
         self.min_blur_score.setRange(0.0, 500.0)
         self.min_blur_score.setValue(0.0)
         self.min_blur_score.setSingleStep(10.0)
-        self.min_blur_score.setToolTip("Minimum sharpness score (0=disabled, 50-300 typical)")
+        self.min_blur_score.setToolTip(
+            "Minimum sharpness score (0=disabled, 50-300 typical)")
         deep_layout.addWidget(self.min_blur_score, 4, 3)
-        
+
         # Row 5: Adaptive C value
         deep_layout.addWidget(QLabel("Adaptive C:"), 5, 0)
         self.adaptive_c_value = QSpinBox()
         self.adaptive_c_value.setRange(1, 20)
         self.adaptive_c_value.setValue(2)
-        self.adaptive_c_value.setToolTip("C parameter for adaptive thresholding. Lower = more sensitive")
+        self.adaptive_c_value.setToolTip(
+            "C parameter for adaptive thresholding. Lower = more sensitive")
         deep_layout.addWidget(self.adaptive_c_value, 5, 1)
-        
+
         # Store labels for dynamic enable/disable
         self.deep_morph_label = deep_layout.itemAtPosition(1, 0).widget()
         self.deep_blur_label = deep_layout.itemAtPosition(1, 2).widget()
         self.deep_dist_label = deep_layout.itemAtPosition(2, 0).widget()
         self.deep_adaptive_label = deep_layout.itemAtPosition(5, 0).widget()
-        
+
         # Connect preprocessing method change to update parameter states
-        self.deep_method.currentTextChanged.connect(self._update_deep_params_state)
-        
+        self.deep_method.currentTextChanged.connect(
+            self._update_deep_params_state)
+
         deep_group.setLayout(deep_layout)
         layout.addWidget(deep_group)
-        
+
         # Initialize parameter states based on default method
         self._update_deep_params_state(self.deep_method.currentText())
-        
+
         # ===== QUICK SETTINGS BUTTONS =====
         settings_group = QGroupBox("Quick Settings")
         settings_layout = QHBoxLayout()
-        
+
         fluorescent_btn = QPushButton("Fluorescent Microscopy")
-        fluorescent_btn.setToolTip("Optimize parameters for fluorescent microscopy (black background)")
-        fluorescent_btn.setStyleSheet("padding: 6px; font-weight: bold; background-color: #2196F3; color: white;")
+        fluorescent_btn.setToolTip(
+            "Optimize parameters for fluorescent microscopy (black background)")
+        fluorescent_btn.setStyleSheet(
+            "padding: 6px; font-weight: bold; background-color: #2196F3; color: white;")
         fluorescent_btn.clicked.connect(self.set_fluorescent_params)
         settings_layout.addWidget(fluorescent_btn)
-        
+
         brightfield_btn = QPushButton("Brightfield Microscopy")
-        brightfield_btn.setToolTip("Optimize parameters for brightfield microscopy (white background)")
-        brightfield_btn.setStyleSheet("padding: 6px; font-weight: bold; background-color: #2196F3; color: white;")
+        brightfield_btn.setToolTip(
+            "Optimize parameters for brightfield microscopy (white background)")
+        brightfield_btn.setStyleSheet(
+            "padding: 6px; font-weight: bold; background-color: #2196F3; color: white;")
         brightfield_btn.clicked.connect(self.set_brightfield_params)
         settings_layout.addWidget(brightfield_btn)
-        
+
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
-        
+
         # ===== ANALYSIS BUTTONS =====
         analysis_group = QGroupBox("Analysis")
         analysis_layout = QVBoxLayout()
-        
+
         self.quick_btn = QPushButton("Quick Analysis")
         self.quick_btn.setEnabled(False)
-        self.quick_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        self.quick_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
         self.quick_btn.clicked.connect(self.run_quick_analysis)
         analysis_layout.addWidget(self.quick_btn)
-        
+
         self.deep_btn = QPushButton("Deep Analysis")
         self.deep_btn.setEnabled(False)
-        self.deep_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        self.deep_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
         self.deep_btn.clicked.connect(self.run_deep_analysis)
         analysis_layout.addWidget(self.deep_btn)
-        
+
         self.both_btn = QPushButton("Run Both & Compare")
         self.both_btn.setEnabled(False)
-        self.both_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        self.both_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
         self.both_btn.setToolTip("Run Quick and Deep analysis on current single image and compare results.\n"
-                                "Use synthetic images for automatic ground truth metrics.")
+                                 "Use synthetic images for automatic ground truth metrics.")
         self.both_btn.clicked.connect(self.run_both_analyses)
         analysis_layout.addWidget(self.both_btn)
-        
+
         # Benchmark button
         self.benchmark_btn = QPushButton("Run Benchmark")
-        self.benchmark_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        self.benchmark_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
         self.benchmark_btn.setToolTip("Run batch analysis on 200+ images.\n"
                                       "Compares Quick vs Deep across many images.\n"
                                       "Generates HTML report with aggregated statistics.")
         self.benchmark_btn.clicked.connect(self.run_benchmark)
         analysis_layout.addWidget(self.benchmark_btn)
-        
+
         analysis_group.setLayout(analysis_layout)
         layout.addWidget(analysis_group)
-        
+
         # ===== MACHINE LEARNING =====
-        if YOLO_AVAILABLE:
-            ml_group = QGroupBox("Machine Learning (YOLO)")
-            ml_layout = QVBoxLayout()
-            
-            load_model_btn = QPushButton("Load YOLO Model")
-            load_model_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
-            load_model_btn.clicked.connect(self.load_yolo_model)
-            ml_layout.addWidget(load_model_btn)
-            
-            self.run_ml_btn = QPushButton("Run ML Detection")
-            self.run_ml_btn.setEnabled(False)
-            self.run_ml_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
-            self.run_ml_btn.clicked.connect(self.run_yolo_detection)
-            ml_layout.addWidget(self.run_ml_btn)
-            
-            self.run_ml_benchmark_btn = QPushButton("Run ML Benchmark")
-            self.run_ml_benchmark_btn.setEnabled(False)
-            self.run_ml_benchmark_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #2196F3;")
-            self.run_ml_benchmark_btn.setToolTip("Run ML detection with full shape/color analysis.\nComparable with Quick and Deep analysis.")
-            self.run_ml_benchmark_btn.clicked.connect(self.run_ml_benchmark)
-            ml_layout.addWidget(self.run_ml_benchmark_btn)
-            
-            self.ml_model_label = QLabel("No model loaded")
-            self.ml_model_label.setStyleSheet("color: gray; font-style: italic;")
-            ml_layout.addWidget(self.ml_model_label)
-            
-            ml_group.setLayout(ml_layout)
-            layout.addWidget(ml_group)
-        
+        ml_group = QGroupBox("Machine Learning (YOLO)")
+        ml_layout = QVBoxLayout()
+
+        load_model_btn = QPushButton("Load YOLO Model")
+        load_model_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        load_model_btn.clicked.connect(self.load_yolo_model)
+        load_model_btn.setEnabled(YOLO_AVAILABLE)
+        ml_layout.addWidget(load_model_btn)
+
+        self.run_ml_btn = QPushButton("Run ML Detection")
+        self.run_ml_btn.setEnabled(False)
+        self.run_ml_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        self.run_ml_btn.clicked.connect(self.run_yolo_detection)
+        ml_layout.addWidget(self.run_ml_btn)
+
+        self.run_ml_benchmark_btn = QPushButton("Run ML Benchmark")
+        self.run_ml_benchmark_btn.setEnabled(False)
+        self.run_ml_benchmark_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #2196F3;")
+        self.run_ml_benchmark_btn.setToolTip(
+            "Run ML detection with full shape/color analysis.\nComparable with Quick and Deep analysis.")
+        self.run_ml_benchmark_btn.clicked.connect(self.run_ml_benchmark)
+        ml_layout.addWidget(self.run_ml_benchmark_btn)
+
+        self.ml_model_label = QLabel("No model loaded")
+        self.ml_model_label.setStyleSheet(
+            "color: gray; font-style: italic;")
+        ml_layout.addWidget(self.ml_model_label)
+
+        ml_group.setLayout(ml_layout)
+        layout.addWidget(ml_group)
+
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
+
         # Results summary
         results_group = QGroupBox("Results Summary")
         results_layout = QVBoxLayout()
-        
+
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
         self.results_text.setMaximumHeight(200)
         results_layout.addWidget(self.results_text)
-        
+
         results_group.setLayout(results_layout)
         layout.addWidget(results_group)
-        
+
         # Export buttons
         export_layout = QHBoxLayout()
-        
+
         export_json_btn = QPushButton("Export JSON")
         export_json_btn.clicked.connect(lambda: self.export_results('json'))
         export_layout.addWidget(export_json_btn)
-        
+
         export_csv_btn = QPushButton("Export CSV")
         export_csv_btn.clicked.connect(lambda: self.export_results('csv'))
         export_layout.addWidget(export_csv_btn)
-        
+
         layout.addLayout(export_layout)
-        
+
         layout.addStretch()
-        
+
         scroll.setWidget(scroll_content)
         main_layout.addWidget(scroll)
-        
+
         return panel
-        
+
+    def _load_default_yolo_model(self):
+        """Load the first bundled YOLO model when ML dependencies are available."""
+        if not YOLO_AVAILABLE:
+            self.ml_model_label.setText(
+                "YOLO unavailable: install PyTorch and Ultralytics"
+            )
+            self.ml_model_label.setStyleSheet("color: red; font-style: italic;")
+            return
+
+        project_root = Path(__file__).resolve().parents[2]
+        model_paths = (
+            project_root / "src" / "ml" / "YoloV8s_v3" / "best.pt",
+            project_root / "src" / "ml" / "FPT_Team_Yolo26" /
+            "FPT_Team_Yolo26" / "weights" / "best.pt",
+        )
+        model_path = next((path for path in model_paths if path.is_file()), None)
+        if model_path is None:
+            self.ml_model_label.setText("No bundled YOLO model found")
+            return
+
+        try:
+            self.yolo_model = YOLO(str(model_path))
+            self.yolo_model_path = str(model_path)
+            self.ml_model_label.setText(f"Model: {model_path.name}")
+            self.ml_model_label.setStyleSheet("color: green; font-weight: bold;")
+            self.run_ml_btn.setEnabled(True)
+            self.run_ml_benchmark_btn.setEnabled(True)
+        except Exception as e:
+            self.ml_model_label.setText(f"Model load failed: {e}")
+            self.ml_model_label.setStyleSheet("color: red;")
+
     def create_display_panel(self):
         """Create right display panel"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        
+
         # Tab widget for different views
         self.tabs = QTabWidget()
-        
+
         # Image tab with zoom controls
         image_tab = QWidget()
         image_layout = QVBoxLayout(image_tab)
-        
+
         # Zoom controls toolbar
         zoom_toolbar = QHBoxLayout()
-        
+
         self.zoom_in_btn = QPushButton("Zoom In (+)")
         self.zoom_in_btn.setToolTip("Zoom in by 20% (Shortcut: + key)")
         self.zoom_in_btn.clicked.connect(self.zoom_in_image)
         zoom_toolbar.addWidget(self.zoom_in_btn)
-        
+
         self.zoom_out_btn = QPushButton("Zoom Out (-)")
         self.zoom_out_btn.setToolTip("Zoom out by 20% (Shortcut: - key)")
         self.zoom_out_btn.clicked.connect(self.zoom_out_image)
         zoom_toolbar.addWidget(self.zoom_out_btn)
-        
+
         self.zoom_reset_btn = QPushButton("Reset Zoom")
-        self.zoom_reset_btn.setToolTip("Reset to original view (Shortcut: 0 key)")
+        self.zoom_reset_btn.setToolTip(
+            "Reset to original view (Shortcut: 0 key)")
         self.zoom_reset_btn.clicked.connect(self.reset_zoom_image)
         zoom_toolbar.addWidget(self.zoom_reset_btn)
-        
+
         self.zoom_box_btn = QPushButton("Box Zoom")
         self.zoom_box_btn.setCheckable(True)
-        self.zoom_box_btn.setToolTip("Enable box zoom: Drag a rectangle to zoom into that area.\nRight-click to zoom out.\nCtrl+Wheel to zoom incrementally.")
+        self.zoom_box_btn.setToolTip(
+            "Enable box zoom: Drag a rectangle to zoom into that area.\nRight-click to zoom out.\nCtrl+Wheel to zoom incrementally.")
         self.zoom_box_btn.toggled.connect(self.toggle_zoom_box)
         zoom_toolbar.addWidget(self.zoom_box_btn)
-        
+
         self.zoom_level_label = QLabel("Zoom: 100%")
         zoom_toolbar.addWidget(self.zoom_level_label)
-        
+
         zoom_toolbar.addStretch()
-        
+
         image_layout.addLayout(zoom_toolbar)
-        
+
         # Scroll area for image
         self.image_scroll_area = QScrollArea()
         self.image_scroll_area.setWidgetResizable(False)
         self.image_scroll_area.setAlignment(Qt.AlignCenter)
-        
+
         self.image_label = ImageLabel()
         self.image_label.set_scroll_area(self.image_scroll_area)
         self.image_scroll_area.setWidget(self.image_label)
         image_layout.addWidget(self.image_scroll_area)
-        
+
         self.tabs.addTab(image_tab, "Original Image")
-        
+
         # Results tab
         results_tab = QWidget()
         results_layout = QVBoxLayout(results_tab)
-        
+
         self.mask_label = ImageLabel()
         results_layout.addWidget(self.mask_label)
-        
+
         self.tabs.addTab(results_tab, "Segmentation Mask")
-        
+
         # Annotated tab with zoom controls
         annotated_tab = QWidget()
         annotated_layout = QVBoxLayout(annotated_tab)
-        
+
         # Zoom controls toolbar for annotated view
         annotated_zoom_toolbar = QHBoxLayout()
-        
+
         self.annotated_zoom_in_btn = QPushButton("Zoom In (+)")
-        self.annotated_zoom_in_btn.setToolTip("Zoom in by 20% (Shortcut: + key)")
+        self.annotated_zoom_in_btn.setToolTip(
+            "Zoom in by 20% (Shortcut: + key)")
         self.annotated_zoom_in_btn.clicked.connect(self.zoom_in_annotated)
         annotated_zoom_toolbar.addWidget(self.annotated_zoom_in_btn)
-        
+
         self.annotated_zoom_out_btn = QPushButton("Zoom Out (-)")
-        self.annotated_zoom_out_btn.setToolTip("Zoom out by 20% (Shortcut: - key)")
+        self.annotated_zoom_out_btn.setToolTip(
+            "Zoom out by 20% (Shortcut: - key)")
         self.annotated_zoom_out_btn.clicked.connect(self.zoom_out_annotated)
         annotated_zoom_toolbar.addWidget(self.annotated_zoom_out_btn)
-        
+
         self.annotated_zoom_reset_btn = QPushButton("Reset Zoom")
-        self.annotated_zoom_reset_btn.setToolTip("Reset to full annotated view (Shortcut: 0 key)")
-        self.annotated_zoom_reset_btn.clicked.connect(self.reset_zoom_annotated)
+        self.annotated_zoom_reset_btn.setToolTip(
+            "Reset to full annotated view (Shortcut: 0 key)")
+        self.annotated_zoom_reset_btn.clicked.connect(
+            self.reset_zoom_annotated)
         annotated_zoom_toolbar.addWidget(self.annotated_zoom_reset_btn)
-        
+
         self.annotated_zoom_box_btn = QPushButton("Box Zoom")
         self.annotated_zoom_box_btn.setCheckable(True)
-        self.annotated_zoom_box_btn.setToolTip("Enable box zoom:\n• Left-click and drag to select area to zoom\n• Right-click to zoom out\n• Ctrl+Wheel to zoom incrementally\n• Press '0' to reset zoom")
-        self.annotated_zoom_box_btn.toggled.connect(self.toggle_zoom_box_annotated)
+        self.annotated_zoom_box_btn.setToolTip(
+            "Enable box zoom:\n• Left-click and drag to select area to zoom\n• Right-click to zoom out\n• Ctrl+Wheel to zoom incrementally\n• Press '0' to reset zoom")
+        self.annotated_zoom_box_btn.toggled.connect(
+            self.toggle_zoom_box_annotated)
         annotated_zoom_toolbar.addWidget(self.annotated_zoom_box_btn)
-        
+
         self.annotated_zoom_level_label = QLabel("Zoom: 100%")
         annotated_zoom_toolbar.addWidget(self.annotated_zoom_level_label)
-        
+
         annotated_zoom_toolbar.addStretch()
-        
+
         annotated_layout.addLayout(annotated_zoom_toolbar)
-        
+
         # Scroll area for annotated image
         self.annotated_scroll_area = QScrollArea()
         self.annotated_scroll_area.setWidgetResizable(False)
         self.annotated_scroll_area.setAlignment(Qt.AlignCenter)
-        
+
         self.annotated_label = ImageLabel()
         self.annotated_label.set_scroll_area(self.annotated_scroll_area)
         self.annotated_scroll_area.setWidget(self.annotated_label)
         annotated_layout.addWidget(self.annotated_scroll_area)
-        
+
         self.tabs.addTab(annotated_tab, "Annotated Results")
-        
+
         # Table tab
         table_tab = QWidget()
         table_layout = QVBoxLayout(table_tab)
-        
+
         self.results_table = QTableWidget()
         table_layout.addWidget(self.results_table)
-        
+
         self.tabs.addTab(table_tab, "Data Table")
-        
+
         # Statistics tab with multiple plots
         stats_tab = QWidget()
         stats_layout = QVBoxLayout(stats_tab)
-        
+
         # Chart control buttons
         chart_controls = QHBoxLayout()
-        
+
         self.refresh_charts_btn = QPushButton("Refresh Charts")
         self.refresh_charts_btn.clicked.connect(self.update_charts_full)
         chart_controls.addWidget(self.refresh_charts_btn)
-        
+
         self.chart_type_combo = QComboBox()
-        self.chart_type_combo.addItems(['All Charts', 'Shape Distribution', 'Size Distribution', 
+        self.chart_type_combo.addItems(['All Charts', 'Shape Distribution', 'Size Distribution',
                                         'Size Categories', 'Color Distribution', 'Circularity Distribution', 'Scatter Plots'])
         self.chart_type_combo.setCurrentIndex(0)  # Default to 'All Charts'
-        self.chart_type_combo.currentTextChanged.connect(self.update_charts_full)
+        self.chart_type_combo.currentTextChanged.connect(
+            self.update_charts_full)
         chart_controls.addWidget(QLabel("Chart Type:"))
         chart_controls.addWidget(self.chart_type_combo)
-        
+
         chart_controls.addStretch()
         stats_layout.addLayout(chart_controls)
-        
+
         # Create matplotlib figure with subplots
         self.figure = Figure(figsize=(12, 8))
         self.canvas = FigureCanvas(self.figure)
         stats_layout.addWidget(self.canvas)
-        
+
         self.tabs.addTab(stats_tab, "Statistics")
-        
+
         layout.addWidget(self.tabs)
-        
+
         return panel
-        
+
     def load_image(self):
         """Load image file"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Image", "", 
+            self, "Open Image", "",
             "Image Files (*.png *.jpg *.jpeg *.tiff *.bmp);;All Files (*)"
         )
-        
+
         if file_path:
             try:
                 # Load image
                 image = cv2.imread(file_path)
                 if image is None:
                     raise ValueError("Failed to load image")
-                
+
                 # Convert to RGB
                 self.current_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
+
                 # Display
                 self.image_label.set_image(self.current_image)
-                
+
                 # Clear ground truth when loading real image
                 self.ground_truth = None
                 self.ground_truth_count = 0
-                
+
                 # Enable analysis buttons
                 self.quick_btn.setEnabled(True)
                 self.deep_btn.setEnabled(True)
                 self.both_btn.setEnabled(True)
-                
+
                 # Auto-detect fluorescent microscopy (black background)
                 gray = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2GRAY)
                 mean_brightness = np.mean(gray)
-                
+
                 if mean_brightness < 50:  # Very dark image - likely fluorescent microscopy
                     self.statusBar().showMessage(
                         f'Loaded: {Path(file_path).name} - Dark background detected (fluorescent microscopy)'
@@ -1037,15 +1168,17 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         "Current settings may miss small particles."
                     )
                 else:
-                    self.statusBar().showMessage(f'Loaded: {Path(file_path).name}')
-                
+                    self.statusBar().showMessage(
+                        f'Loaded: {Path(file_path).name}')
+
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load image: {str(e)}")
-    
+                QMessageBox.critical(
+                    self, "Error", f"Failed to load image: {str(e)}")
+
     def _update_deep_params_state(self, method):
         """Enable/disable deep analysis parameters based on selected preprocessing method"""
         # All methods use min_area and max_area - always enabled
-        
+
         # Watershed uses: blur, distance_thresh, marker_size
         is_watershed = (method == 'watershed')
         self.deep_blur.setEnabled(is_watershed)
@@ -1054,17 +1187,19 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.deep_dist_label.setEnabled(is_watershed)
         self.deep_marker_size.setEnabled(is_watershed)
         self.deep_morph_label.setEnabled(is_watershed)
-        
+
         # Adaptive uses: adaptive_c_value
         is_adaptive = (method == 'adaptive')
         self.adaptive_c_value.setEnabled(is_adaptive)
         self.deep_adaptive_label.setEnabled(is_adaptive)
-        
+
         # Update tooltips to show when parameters are inactive
         if not is_watershed:
             self.deep_blur.setToolTip("Only used by 'watershed' preprocessing")
-            self.deep_distance_thresh.setToolTip("Only used by 'watershed' preprocessing")
-            self.deep_marker_size.setToolTip("Only used by 'watershed' preprocessing")
+            self.deep_distance_thresh.setToolTip(
+                "Only used by 'watershed' preprocessing")
+            self.deep_marker_size.setToolTip(
+                "Only used by 'watershed' preprocessing")
         else:
             self.deep_blur.setToolTip("Gaussian blur kernel size")
             self.deep_distance_thresh.setToolTip(
@@ -1078,85 +1213,122 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 "• Smaller (2-3): Tighter object boundaries\n"
                 "• Larger (4-5): More conservative separation"
             )
-        
+
         if not is_adaptive:
-            self.adaptive_c_value.setToolTip("Only used by 'adaptive' preprocessing")
+            self.adaptive_c_value.setToolTip(
+                "Only used by 'adaptive' preprocessing")
         else:
-            self.adaptive_c_value.setToolTip("C parameter for adaptive thresholding. Lower = more sensitive")
-    
+            self.adaptive_c_value.setToolTip(
+                "C parameter for adaptive thresholding. Lower = more sensitive")
+
     def capture_from_esp_camera(self):
         """Capture image from ESP32-CAM via HTTP or USB Camera"""
         from PyQt5.QtWidgets import QInputDialog
         import urllib.request
         import urllib.error
-        
+
         # Ask user to choose camera source
-        items = ["USB Camera (Direct)", "ESP32-CAM (Network)"]
+        items = [
+            "Raspberry Pi AI Camera (libcamera)",
+            "USB Camera (Direct)",
+            "ESP32-CAM (Network)",
+        ]
         source, ok = QInputDialog.getItem(
             self,
             "Camera Source",
             "Select camera source:",
             items, 0, False
         )
-        
+
         if not ok:
             return
-        
+
+        if "AI Camera" in source:
+            self._capture_from_ai_camera()
+            return
+
         if "USB" in source:
             # USB Camera Mode
             self._capture_from_usb_camera()
             return
-        
+
         # ESP32-CAM Network Mode
-        # Ask for ESP32-CAM IP address
-        ip, ok = QInputDialog.getText(
+        # Ask for ESP32-CAM address or a complete capture URL
+        address, ok = QInputDialog.getText(
             self,
             "ESP32-CAM Configuration",
-            f"Enter ESP32-CAM IP address:",
+            "Enter ESP32-CAM IP address or capture URL:",
             text=self.esp_camera_ip
         )
-        
-        if not ok or not ip:
+
+        if not ok or not address.strip():
             return
-        
-        self.esp_camera_ip = ip
-        
+
+        address = address.strip().rstrip("/")
+        if not address.startswith(("http://", "https://")):
+            address = f"http://{address}"
+        self.esp_camera_ip = address
+
         try:
-            # Construct ESP32-CAM capture URL
-            url = f"http://{self.esp_camera_ip}/capture"
-            
-            self.statusBar().showMessage(f"Connecting to ESP32-CAM at {self.esp_camera_ip}...")
+            self.statusBar().showMessage(
+                f"Connecting to ESP32-CAM at {self.esp_camera_ip}...")
             QApplication.processEvents()
-            
-            # Request image from ESP32-CAM
-            with urllib.request.urlopen(url, timeout=5) as response:
-                img_array = np.asarray(bytearray(response.read()), dtype=np.uint8)
-                image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            
+
+            # Support a full URL and common ESP32-CAM JPEG endpoints.
+            if address.lower().endswith((".jpg", ".jpeg", "/capture", "/shot")):
+                capture_urls = [address]
+            else:
+                capture_urls = [
+                    f"{address}/capture",
+                    f"{address}/shot",
+                    f"{address}/jpg",
+                ]
+
+            image = None
+            last_error = None
+            for url in capture_urls:
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        img_array = np.asarray(
+                            bytearray(response.read()), dtype=np.uint8)
+                    image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    if image is not None:
+                        break
+                    last_error = ValueError(
+                        f"Endpoint returned non-JPEG data: {url}")
+                except urllib.error.URLError as error:
+                    last_error = error
+
             if image is None:
-                raise ValueError("Failed to decode image from ESP32-CAM")
-            
+                raise ValueError(
+                    "No JPEG image was returned by the camera. "
+                    f"Tried: {', '.join(capture_urls)}. "
+                    f"Last error: {last_error}"
+                )
+
             # Convert BGR to RGB
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
+
             # Store and display
             self.current_image = image
             self.ground_truth = None
             self.ground_truth_count = 0
-            
+
             # Display image using custom ImageLabel method
             self.image_label.set_image(image)
-            
+
             # Enable analysis buttons
             self.quick_btn.setEnabled(True)
             self.deep_btn.setEnabled(True)
-            
+
             h, w, c = image.shape
-            self.statusBar().showMessage(f'Captured from ESP32-CAM ({w}x{h})')
+            self.statusBar().showMessage(
+                f'Captured from ESP32-CAM ({w}x{h})')
             self.results_text.clear()
-            self.results_text.append(f"✓ Image captured from ESP32-CAM at {self.esp_camera_ip}")
+            self.results_text.append(
+                f"✓ Image captured from ESP32-CAM at {address}")
             self.results_text.append(f"  Resolution: {w}x{h}")
-            
+
         except urllib.error.URLError as e:
             QMessageBox.critical(
                 self,
@@ -1170,40 +1342,24 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 f"4. ESP32-CAM firmware supports /capture endpoint"
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to capture image: {str(e)}")
-    
+            QMessageBox.critical(
+                self, "Error", f"Failed to capture image: {str(e)}")
+
     def _capture_from_usb_camera(self):
         """Open camera preview window with capture button"""
         from PyQt5.QtWidgets import QInputDialog, QDialog, QVBoxLayout, QPushButton, QLabel
         from PyQt5.QtCore import QTimer
-        
+
+        if platform.system() == 'Windows':
+            self._capture_from_windows_usb_camera()
+            return
+
         # Detect available cameras
         self.statusBar().showMessage("Detecting available cameras...")
         QApplication.processEvents()
-        
-        # Suppress OpenCV error messages during camera detection
-        import os
-        old_stderr = os.dup(2)  # Save stderr file descriptor
-        os.close(2)  # Close stderr temporarily
-        
-        available_cameras = []
-        backend = _get_camera_backend()
-        for i in range(3):  # Check first 3 camera indices (faster)
-            try:
-                cap = cv2.VideoCapture(i, backend)
-                if cap.isOpened():
-                    # Quick check without reading full frame
-                    ret = cap.grab()
-                    if ret:
-                        available_cameras.append(i)
-                    cap.release()
-            except:
-                pass
-        
-        # Restore stderr
-        os.dup2(old_stderr, 2)
-        os.close(old_stderr)
-        
+
+        available_cameras = _get_available_usb_cameras()
+
         if not available_cameras:
             QMessageBox.warning(
                 self,
@@ -1215,75 +1371,79 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 "• Camera is not being used by another application"
             )
             return
-        
+
         # Create camera selection dialog
         camera_names = []
-        for idx in available_cameras:
-            if idx == 0:
-                camera_names.append(f"Camera {idx} (Built-in/Default)")
-            else:
-                camera_names.append(f"Camera {idx} (USB/External)")
-        
+        for camera_id, description in available_cameras:
+            camera_names.append(f"{description} (index {camera_id})")
+
+        # Prefer a non-default device when multiple cameras are available.
+        preferred_index = next(
+            (position for position, (camera_id, _) in enumerate(available_cameras)
+             if camera_id != 0),
+            0,
+        )
         camera_choice, ok = QInputDialog.getItem(
             self,
             "Select Camera",
             f"Found {len(available_cameras)} camera(s). Select one:",
             camera_names,
-            0,
+            preferred_index,
             False
         )
-        
+
         if not ok:
             return
-        
+
         # Extract camera index from selection
-        camera_id = available_cameras[camera_names.index(camera_choice)]
-        
+        camera_id = available_cameras[camera_names.index(camera_choice)][0]
+
         try:
-            # Open camera with platform-specific backend
-            backend = _get_camera_backend()
-            cap = cv2.VideoCapture(camera_id, backend)
-            
-            if not cap.isOpened():
+            cap = _open_camera_capture(camera_id)
+            if cap is None:
                 raise ValueError(f"Cannot open camera {camera_id}")
-            
+
             # Set camera resolution
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            
+
             # Flush camera buffer - grab just 2 frames to ensure fresh feed
             cap.grab()
             cap.grab()
-            
+
             # Create camera preview dialog
             dialog = QDialog(self)
             dialog.setWindowTitle(f"USB Camera {camera_id} - Live Preview")
             dialog.setModal(True)
             dialog.resize(800, 650)
-            
+
             layout = QVBoxLayout()
-            
+
             # Video preview label
             video_label = QLabel()
             video_label.setMinimumSize(640, 480)
-            video_label.setStyleSheet("border: 2px solid #333; background-color: black;")
+            video_label.setStyleSheet(
+                "border: 2px solid #333; background-color: black;")
+            video_label.setText("Waiting for camera frames...")
             layout.addWidget(video_label)
-            
+
             # Capture button
             capture_btn = QPushButton("📷 Capture Image")
-            capture_btn.setStyleSheet("padding: 10px; font-size: 14px; font-weight: bold; background-color: #4CAF50;")
+            capture_btn.setStyleSheet(
+                "padding: 10px; font-size: 14px; font-weight: bold; background-color: #4CAF50;")
             layout.addWidget(capture_btn)
-            
+
             # Close button
             close_btn = QPushButton("Close Camera")
             close_btn.setStyleSheet("padding: 8px; font-size: 12px;")
             layout.addWidget(close_btn)
-            
+
             dialog.setLayout(layout)
-            
+
             # Variables to store captured image
-            captured_image = [None]  # Use list to allow modification in nested function
-            
+            # Use list to allow modification in nested function
+            captured_image = [None]
+
             def update_frame():
                 """Update video preview"""
                 ret, frame = cap.read()
@@ -1293,62 +1453,77 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     h, w, c = frame_rgb.shape
                     bytes_per_line = c * w
                     # Make a copy to ensure data is not overwritten
-                    qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+                    qt_image = QImage(
+                        frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
                     pixmap = QPixmap.fromImage(qt_image)
                     # Scale to fit label while maintaining aspect ratio
-                    scaled_pixmap = pixmap.scaled(video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    scaled_pixmap = pixmap.scaled(
+                        video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     video_label.setPixmap(scaled_pixmap)
-            
+                else:
+                    video_label.setText(
+                        "No frame received. Check the camera connection or close "
+                        "other apps using it.")
+
             def capture_image():
                 """Capture current frame"""
                 ret, frame = cap.read()
                 if ret:
                     # Make a copy to ensure the image is not overwritten
-                    captured_image[0] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).copy()
+                    captured_image[0] = cv2.cvtColor(
+                        frame, cv2.COLOR_BGR2RGB).copy()
                     dialog.accept()
-            
+                else:
+                    self.statusBar().showMessage(
+                        "No camera frame is available to capture.")
+
             def close_camera():
                 """Close camera and dialog"""
                 dialog.reject()
-            
+
             # Connect buttons
             capture_btn.clicked.connect(capture_image)
             close_btn.clicked.connect(close_camera)
-            
+
             # Setup timer for video preview
             timer = QTimer()
             timer.timeout.connect(update_frame)
             timer.start(30)  # Update every 30ms (~33 fps)
-            
+
             # Show dialog and wait for user action
             result = dialog.exec_()
-            
+
             # Stop timer and release camera
             timer.stop()
             cap.release()
-            
+
             # If image was captured, load it
             if result == QDialog.Accepted and captured_image[0] is not None:
                 image = captured_image[0]
-                
+
                 # Store and display
                 self.current_image = image
                 self.ground_truth = None
                 self.ground_truth_count = 0
-                
+
+                # >>> DÒNG MỚI THÊM <
+                self.current_frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
                 # Display image using custom ImageLabel method
                 self.image_label.set_image(image)
-                
+
                 # Enable analysis buttons
                 self.quick_btn.setEnabled(True)
                 self.deep_btn.setEnabled(True)
-                
+
                 h, w, c = image.shape
-                self.statusBar().showMessage(f'Captured from USB Camera {camera_id} ({w}x{h})')
+                self.statusBar().showMessage(
+                    f'Captured from USB Camera {camera_id} ({w}x{h})')
                 self.results_text.clear()
-                self.results_text.append(f"✓ Image captured from USB Camera {camera_id}")
+                self.results_text.append(
+                    f"✓ Image captured from USB Camera {camera_id}")
                 self.results_text.append(f"  Resolution: {w}x{h}")
-            
+
         except Exception as e:
             # Build platform-specific error message
             system = platform.system()
@@ -1375,7 +1550,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     f"3. Install v4l-utils: sudo apt-get install v4l-utils\\n"
                     f"4. Log out and back in for group changes to take effect\\n"
                 )
-            
+
             QMessageBox.critical(
                 self,
                 "Camera Error",
@@ -1387,7 +1562,253 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 f"{platform_help}"
                 f"\\n4. Try a different camera index (0, 1, 2...)"
             )
-                
+
+    def _capture_from_windows_usb_camera(self):
+        """Preview and capture a Windows camera by its Qt device identity."""
+        from PyQt5.QtMultimedia import QCamera, QCameraImageCapture, QCameraInfo
+        from PyQt5.QtMultimediaWidgets import QCameraViewfinder
+        from PyQt5.QtWidgets import QInputDialog, QDialog, QVBoxLayout, QPushButton, QLabel
+
+        cameras = QCameraInfo.availableCameras()
+        if not cameras:
+            QMessageBox.warning(
+                self,
+                "No Cameras Found",
+                "Windows did not report any available cameras. Check that the "
+                "camera is connected, enabled in Windows privacy settings, and "
+                "not being used by another application.",
+            )
+            return
+
+        camera_names = [
+            camera.description() or f"Camera {index}"
+            for index, camera in enumerate(cameras)
+        ]
+        preferred_index = next(
+            (index for index, name in enumerate(camera_names)
+             if "built-in" not in name.lower() and "integrated" not in name.lower()),
+            0,
+        )
+        camera_name, accepted = QInputDialog.getItem(
+            self,
+            "Select Camera",
+            f"Found {len(cameras)} camera(s). Select one:",
+            camera_names,
+            preferred_index,
+            False,
+        )
+        if not accepted:
+            return
+
+        camera_info = cameras[camera_names.index(camera_name)]
+        camera = QCamera(camera_info)
+        viewfinder = QCameraViewfinder()
+        camera.setViewfinder(viewfinder)
+        camera.setCaptureMode(QCamera.CaptureStillImage)
+
+        image_capture = QCameraImageCapture(camera)
+        image_capture.setCaptureDestination(
+            QCameraImageCapture.CaptureToBuffer)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{camera_name} - Live Preview")
+        dialog.setModal(True)
+        dialog.resize(800, 650)
+        layout = QVBoxLayout(dialog)
+
+        viewfinder.setMinimumSize(640, 480)
+        viewfinder.setStyleSheet(
+            "border: 2px solid #333; background-color: black;")
+        layout.addWidget(viewfinder)
+
+        status_label = QLabel("Starting camera...")
+        layout.addWidget(status_label)
+
+        capture_btn = QPushButton("Capture Image")
+        close_btn = QPushButton("Close Camera")
+        layout.addWidget(capture_btn)
+        layout.addWidget(close_btn)
+
+        captured_image = []
+
+        def on_image_captured(_request_id, image):
+            captured_image.append(image.copy())
+            dialog.accept()
+
+        def on_camera_error(_error):
+            status_label.setText(f"Camera error: {camera.errorString()}")
+
+        def on_capture_error(_request_id, _error, message):
+            status_label.setText(f"Capture error: {message}")
+
+        image_capture.imageCaptured.connect(on_image_captured)
+        camera.error.connect(on_camera_error)
+        image_capture.error.connect(on_capture_error)
+
+        def capture_image():
+            if image_capture.isReadyForCapture():
+                status_label.setText("Capturing image...")
+                image_capture.capture()
+            else:
+                status_label.setText("Camera is not ready to capture yet.")
+
+        capture_btn.clicked.connect(capture_image)
+        close_btn.clicked.connect(dialog.reject)
+
+        try:
+            camera.start()
+            result = dialog.exec_()
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Camera Error", f"Failed to open {camera_name}: {error}")
+            return
+        finally:
+            camera.stop()
+
+        if result != QDialog.Accepted or not captured_image:
+            return
+
+        image_qt = captured_image[0].convertToFormat(QImage.Format_RGB888)
+        height = image_qt.height()
+        width = image_qt.width()
+        image_data = image_qt.bits().asstring(
+            image_qt.bytesPerLine() * height)
+        image = np.frombuffer(image_data, dtype=np.uint8).reshape(
+            height, image_qt.bytesPerLine())[:, :width * 3].reshape(
+                height, width, 3).copy()
+
+        self.current_image = image
+        self.current_frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        self.ground_truth = None
+        self.ground_truth_count = 0
+        self.image_label.set_image(image)
+        self.quick_btn.setEnabled(True)
+        self.deep_btn.setEnabled(True)
+        self.statusBar().showMessage(
+            f"Captured from {camera_name} ({width}x{height})")
+        self.results_text.clear()
+        self.results_text.append(f"Image captured from {camera_name}")
+        self.results_text.append(f"  Resolution: {width}x{height}")
+
+    def _capture_from_ai_camera(self):
+        """Preview and capture a Raspberry Pi AI Camera through libcamera."""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QPushButton, QLabel
+        from PyQt5.QtCore import QTimer
+
+        if Picamera2 is None:
+            QMessageBox.warning(
+                self,
+                "Picamera2 is not installed",
+                "Install the Raspberry Pi libcamera packages first:\n\n"
+                "sudo apt update\n"
+                "sudo apt install -y python3-picamera2 libcamera-apps",
+            )
+            return
+
+        camera = None
+        camera_started = False
+        timer = None
+        captured_image = [None]
+
+        try:
+            camera = Picamera2()
+            configuration = camera.create_preview_configuration(
+                main={"size": (1280, 720), "format": "RGB888"}
+            )
+            camera.configure(configuration)
+            camera.start()
+            camera_started = True
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Raspberry Pi AI Camera - Live Preview")
+            dialog.setModal(True)
+            dialog.resize(800, 650)
+            layout = QVBoxLayout(dialog)
+
+            video_label = QLabel()
+            video_label.setMinimumSize(640, 480)
+            video_label.setStyleSheet(
+                "border: 2px solid #333; background-color: black;"
+            )
+            layout.addWidget(video_label)
+
+            capture_btn = QPushButton("Capture Image")
+            capture_btn.setStyleSheet(
+                "padding: 10px; font-size: 14px; font-weight: bold; "
+                "background-color: #4CAF50;"
+            )
+            layout.addWidget(capture_btn)
+            close_btn = QPushButton("Close Camera")
+            layout.addWidget(close_btn)
+
+            def read_frame():
+                frame = camera.capture_array("main")
+                if frame is None:
+                    return
+                height, width, channels = frame.shape
+                qt_image = QImage(
+                    frame.data,
+                    width,
+                    height,
+                    channels * width,
+                    QImage.Format_RGB888,
+                ).copy()
+                video_label.setPixmap(
+                    QPixmap.fromImage(qt_image).scaled(
+                        video_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                )
+
+            def capture_image():
+                frame = camera.capture_array("main")
+                if frame is not None:
+                    captured_image[0] = frame.copy()
+                    dialog.accept()
+
+            capture_btn.clicked.connect(capture_image)
+            close_btn.clicked.connect(dialog.reject)
+            timer = QTimer(dialog)
+            timer.timeout.connect(read_frame)
+            timer.start(30)
+            result = dialog.exec_()
+
+            if result == QDialog.Accepted and captured_image[0] is not None:
+                image = captured_image[0]
+                self.current_image = image
+                self.current_frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                self.ground_truth = None
+                self.ground_truth_count = 0
+                self.image_label.set_image(image)
+                self.quick_btn.setEnabled(True)
+                self.deep_btn.setEnabled(True)
+
+                height, width, _ = image.shape
+                self.statusBar().showMessage(
+                    f"Captured from Raspberry Pi AI Camera ({width}x{height})"
+                )
+                self.results_text.clear()
+                self.results_text.append(
+                    "Captured from Raspberry Pi AI Camera (libcamera)"
+                )
+                self.results_text.append(f"  Resolution: {width}x{height}")
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "AI Camera Error",
+                "Failed to open the Raspberry Pi AI Camera through libcamera.\n\n"
+                f"Error: {e}\n\n"
+                "Check that the camera is detected with: libcamera-hello",
+            )
+        finally:
+            if timer is not None:
+                timer.stop()
+            if camera is not None:
+                if camera_started:
+                    camera.stop()
+                camera.close()
+
     def get_analysis_params(self, analysis_type='quick'):
         """Get current analysis parameters based on type"""
         if analysis_type == 'quick':
@@ -1396,7 +1817,8 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 min_area=self.quick_min_area.value(),
                 max_area=self.quick_max_area.value(),
                 blur=self.quick_blur.value(),
-                distance_thresh=self.quick_distance_thresh.value()
+                distance_thresh=self.quick_distance_thresh.value(),
+                adaptive_c_value=self.adaptive_c_value.value()
             )
         else:  # deep
             return PreprocessingParams(
@@ -1410,49 +1832,51 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 min_blur_score=self.min_blur_score.value(),
                 adaptive_c_value=self.adaptive_c_value.value()
             )
-        
+
     def run_quick_analysis(self):
         """Run quick analysis"""
         if self.current_image is None:
             return
-            
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate
         self.statusBar().showMessage('Running quick analysis...')
-        
+
         params = self.get_analysis_params('quick')
-        
-        self.analysis_thread = AnalysisThread(self.current_image, params, 'quick')
+
+        self.analysis_thread = AnalysisThread(
+            self.current_image, params, 'quick')
         self.analysis_thread.finished.connect(self.on_analysis_complete)
         self.analysis_thread.progress.connect(self.statusBar().showMessage)
         self.analysis_thread.start()
-        
+
     def run_deep_analysis(self):
         """Run deep analysis"""
         if self.current_image is None:
             return
-            
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.statusBar().showMessage('Running deep analysis...')
-        
+
         params = self.get_analysis_params('deep')
-        
-        self.analysis_thread = AnalysisThread(self.current_image, params, 'deep')
+
+        self.analysis_thread = AnalysisThread(
+            self.current_image, params, 'deep')
         self.analysis_thread.finished.connect(self.on_analysis_complete)
         self.analysis_thread.progress.connect(self.statusBar().showMessage)
         self.analysis_thread.start()
-        
+
     def run_both_analyses(self):
         """Run both Quick and Deep analyses and compare results"""
         if self.current_image is None:
             return
-        
+
         # Check if ground truth is set
         if self.ground_truth_count == 0:
             from PyQt5.QtWidgets import QMessageBox
             reply = QMessageBox.warning(
-                self, 
+                self,
                 "No Ground Truth Set",
                 "⚠️ No ground truth is set for this image.\n\n"
                 "Without ground truth, Precision, Recall, and F1-Score will be 0.00.\n\n"
@@ -1465,110 +1889,121 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             )
             if reply == QMessageBox.No:
                 return
-            
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.statusBar().showMessage('Running both analyses...')
         self.results_text.clear()
         self.results_text.append("Running both Quick and Deep analyses...")
-        
+
         import time
         start_time = time.time()
-        
+
         # Run Quick Analysis
         quick_params = self.get_analysis_params('quick')
         quick_analyzer = QuickAnalyzer()
         quick_result = quick_analyzer.analyze(self.current_image, quick_params)
-        
+
         # Run Deep Analysis
         deep_params = self.get_analysis_params('deep')
         deep_analyzer = DeepAnalyzer()
         deep_result = deep_analyzer.analyze(self.current_image, deep_params)
-        
+
         total_time = time.time() - start_time
-        
+
         # Store both results
         self.quick_result = quick_result
         self.deep_result = deep_result
         self.current_result = deep_result  # Use deep as primary
-        
+
         # Create comparison visualization
         self.create_comparison_visualization(quick_result, deep_result)
-        
+
         # Compare and display results with statistics
         self.compare_analysis_results(quick_result, deep_result, total_time)
-        
+
         # Create comprehensive statistics chart comparing both methods
         self.create_comparison_statistics_chart(quick_result, deep_result)
-        
+
         # Update table with deep results
         self.update_results_table(deep_result)
-        
+
         self.progress_bar.setVisible(False)
-        self.statusBar().showMessage(f'Both analyses complete in {total_time:.2f}s')
-        
+        self.statusBar().showMessage(
+            f'Both analyses complete in {total_time:.2f}s')
+
     def create_comparison_visualization(self, quick_result, deep_result):
         """Create visualization comparing Quick and Deep analysis"""
         comparison_image = self.current_image.copy()
-        
+
         # Draw Quick analysis boundaries in blue
         for feature in quick_result.features:
             bbox = feature.get('bounding_box')
             if bbox:
                 x, y, w, h = bbox
-                cv2.rectangle(comparison_image, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                cv2.rectangle(comparison_image, (x, y),
+                              (x+w, y+h), (255, 0, 0), 2)
                 centroid = feature.get('centroid', (x + w//2, y + h//2))
-                cv2.circle(comparison_image, (int(centroid[0]), int(centroid[1])), 3, (255, 0, 0), -1)
-        
+                cv2.circle(comparison_image, (int(centroid[0]), int(
+                    centroid[1])), 3, (255, 0, 0), -1)
+
         # Draw Deep analysis boundaries in green
         for feature in deep_result.features:
             bbox = feature.get('bounding_box')
             if bbox:
                 x, y, w, h = bbox
-                cv2.rectangle(comparison_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.rectangle(comparison_image, (x, y),
+                              (x+w, y+h), (0, 255, 0), 2)
                 centroid = feature.get('centroid', (x + w//2, y + h//2))
-                cv2.circle(comparison_image, (int(centroid[0]), int(centroid[1])), 3, (0, 255, 0), -1)
-        
+                cv2.circle(comparison_image, (int(centroid[0]), int(
+                    centroid[1])), 3, (0, 255, 0), -1)
+
         # Add legend
         cv2.putText(comparison_image, "Quick Analysis (Blue)", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
         cv2.putText(comparison_image, "Deep Analysis (Green)", (10, 65),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
         # Display in annotated tab
         self.annotated_label.set_image(comparison_image)
         self.tabs.setCurrentIndex(2)  # Switch to annotated tab
-        
+
     def compare_analysis_results(self, quick_result, deep_result, total_time):
         """Compare Quick and Deep analysis results"""
         import math
-        
+
         quick_count = quick_result.num_detections
         deep_count = deep_result.num_detections
-        
+
         text = "\n=== COMPARISON RESULTS ===\n"
-        
+
         # Ground Truth Comparison (if available)
         if self.ground_truth_count > 0:
             text += f"\nGROUND TRUTH: {self.ground_truth_count} particles\n"
             text += "-" * 50 + "\n"
-            
+
             # Quick vs Ground Truth
-            quick_precision = min(quick_count, self.ground_truth_count) / quick_count if quick_count > 0 else 0
-            quick_recall = min(quick_count, self.ground_truth_count) / self.ground_truth_count
-            quick_f1 = 2 * (quick_precision * quick_recall) / (quick_precision + quick_recall) if (quick_precision + quick_recall) > 0 else 0
-            
+            quick_precision = min(
+                quick_count, self.ground_truth_count) / quick_count if quick_count > 0 else 0
+            quick_recall = min(
+                quick_count, self.ground_truth_count) / self.ground_truth_count
+            quick_f1 = 2 * (quick_precision * quick_recall) / (quick_precision +
+                                                               quick_recall) if (quick_precision + quick_recall) > 0 else 0
+
             text += f"\nQuick Analysis vs Ground Truth:\n"
             text += f"  Detected: {quick_count} | True: {self.ground_truth_count}\n"
             text += f"  Precision: {quick_precision:.3f} ({quick_precision*100:.1f}%)\n"
             text += f"  Recall: {quick_recall:.3f} ({quick_recall*100:.1f}%)\n"
             text += f"  F1-Score: {quick_f1:.3f} ({quick_f1*100:.1f}%)\n"
-            
+
             # Deep vs Ground Truth
-            deep_precision = min(deep_count, self.ground_truth_count) / deep_count if deep_count > 0 else 0
-            deep_recall = min(deep_count, self.ground_truth_count) / self.ground_truth_count
-            deep_f1 = 2 * (deep_precision * deep_recall) / (deep_precision + deep_recall) if (deep_precision + deep_recall) > 0 else 0
-            
+            deep_precision = min(
+                deep_count, self.ground_truth_count) / deep_count if deep_count > 0 else 0
+            deep_recall = min(
+                deep_count, self.ground_truth_count) / self.ground_truth_count
+            deep_f1 = 2 * (deep_precision * deep_recall) / (deep_precision +
+                                                            deep_recall) if (deep_precision + deep_recall) > 0 else 0
+
             text += f"\nDeep Analysis vs Ground Truth:\n"
             text += f"  Detected: {deep_count} | True: {self.ground_truth_count}\n"
             text += f"  Precision: {deep_precision:.3f} ({deep_precision*100:.1f}%)\n"
@@ -1585,105 +2020,106 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             text += "  • Shape/color distributions\n"
             text += "  • Processing times\n"
             text += "=" * 50 + "\n"
-            
+
             text += "\n" + "=" * 50 + "\n"
-        
+
         text += f"Quick Analysis: {quick_count} particles in {quick_result.processing_time:.2f}s\n"
         text += f"Deep Analysis: {deep_count} particles in {deep_result.processing_time:.2f}s\n"
         text += f"Total time: {total_time:.2f} seconds\n"
-        
+
         # Find common detections based on centroid proximity
         common_detections = 0
         quick_only = 0
         deep_only = 0
         threshold_distance = 15  # pixels
-        
+
         matched_deep = set()
-        
+
         for q_feature in quick_result.features:
             q_centroid = q_feature.get('centroid', (0, 0))
             matched = False
-            
+
             for i, d_feature in enumerate(deep_result.features):
                 if i in matched_deep:
                     continue
                 d_centroid = d_feature.get('centroid', (0, 0))
                 distance = math.sqrt((q_centroid[0] - d_centroid[0])**2 +
-                                    (q_centroid[1] - d_centroid[1])**2)
-                
+                                     (q_centroid[1] - d_centroid[1])**2)
+
                 if distance < threshold_distance:
                     matched = True
                     matched_deep.add(i)
                     break
-            
+
             if matched:
                 common_detections += 1
             else:
                 quick_only += 1
-        
+
         deep_only = deep_count - common_detections
-        
+
         text += f"\nDetection Comparison:\n"
         text += f"  Common detections: {common_detections}\n"
         text += f"  Quick only: {quick_only}\n"
         text += f"  Deep only: {deep_only}\n"
-        
+
         # Calculate agreement percentages
         if quick_count > 0 and deep_count > 0:
-            agreement_percentage = (common_detections / min(quick_count, deep_count)) * 100
+            agreement_percentage = (
+                common_detections / min(quick_count, deep_count)) * 100
             text += f"  Detection agreement: {agreement_percentage:.1f}%\n"
-        
+
         # Compare shape classifications for common detections
         if common_detections > 0:
             shape_agreement = 0
             color_agreement = 0
-            
+
             matched_deep_for_class = set()
-            
+
             for q_feature in quick_result.features:
                 q_centroid = q_feature.get('centroid', (0, 0))
                 q_shape = q_feature.get('shape', '')
                 q_color = q_feature.get('color', '')
-                
+
                 for i, d_feature in enumerate(deep_result.features):
                     if i in matched_deep_for_class:
                         continue
                     d_centroid = d_feature.get('centroid', (0, 0))
                     distance = math.sqrt((q_centroid[0] - d_centroid[0])**2 +
-                                        (q_centroid[1] - d_centroid[1])**2)
-                    
+                                         (q_centroid[1] - d_centroid[1])**2)
+
                     if distance < threshold_distance:
                         d_shape = d_feature.get('shape', '')
                         d_color = d_feature.get('color', '')
-                        
+
                         if q_shape == d_shape:
                             shape_agreement += 1
                         if q_color == d_color:
                             color_agreement += 1
                         matched_deep_for_class.add(i)
                         break
-            
+
             shape_agreement_pct = (shape_agreement / common_detections) * 100
             color_agreement_pct = (color_agreement / common_detections) * 100
-            
+
             text += f"\nClassification Agreement:\n"
             text += f"  Shape agreement: {shape_agreement_pct:.1f}%\n"
             text += f"  Color agreement: {color_agreement_pct:.1f}%\n"
-        
+
         self.results_text.append(text)
-    
+
     def create_comparison_statistics_chart(self, quick_result, deep_result):
         """Create comprehensive comparison statistics chart in Statistics tab"""
         self.figure.clear()
-        
+
         from collections import Counter
         import numpy as np
-        
+
         # Calculate metrics for both methods
         quick_count = quick_result.num_detections
         deep_count = deep_result.num_detections
         gt_count = self.ground_truth_count
-        
+
         # Create 3x2 subplot layout (6 panels)
         ax1 = self.figure.add_subplot(3, 2, 1)  # Detection counts
         ax2 = self.figure.add_subplot(3, 2, 2)  # Metrics (Precision/Recall/F1)
@@ -1691,7 +2127,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         ax4 = self.figure.add_subplot(3, 2, 4)  # Color distribution comparison
         ax5 = self.figure.add_subplot(3, 2, 5)  # Area (pixel) distribution
         ax6 = self.figure.add_subplot(3, 2, 6)  # Processing time
-        
+
         # 1. Detection Count Comparison
         if self.ground_truth and len(self.ground_truth) > 0:
             # 3-way comparison with ground truth
@@ -1703,222 +2139,273 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             methods = ['Quick', 'Deep']
             counts = [quick_count, deep_count]
             colors_bar = ['#2196F3', '#4CAF50']
-        
-        bars = ax1.bar(methods, counts, color=colors_bar, alpha=0.8, edgecolor='black', linewidth=2)
-        
+
+        bars = ax1.bar(methods, counts, color=colors_bar,
+                       alpha=0.8, edgecolor='black', linewidth=2)
+
         ax1.set_ylabel('Particle Count', fontsize=11, fontweight='bold')
-        ax1.set_title('Detection Count Comparison', fontsize=12, fontweight='bold')
+        ax1.set_title('Detection Count Comparison',
+                      fontsize=12, fontweight='bold')
         ax1.grid(True, alpha=0.3, axis='y')
-        
+
         # Add value labels on bars
         for i, (bar, count) in enumerate(zip(bars, counts)):
             height = bar.get_height()
             ax1.text(bar.get_x() + bar.get_width()/2., height + max(counts) * 0.02,
-                    f'{int(count)}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
+                     f'{int(count)}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
         # 2. Performance Metrics (if ground truth available)
         if gt_count > 0:
             # Calculate metrics
-            quick_precision = min(quick_count, gt_count) / quick_count if quick_count > 0 else 0
-            quick_recall = min(quick_count, gt_count) / gt_count if gt_count > 0 else 0
-            quick_f1 = 2 * (quick_precision * quick_recall) / (quick_precision + quick_recall) if (quick_precision + quick_recall) > 0 else 0
-            
-            deep_precision = min(deep_count, gt_count) / deep_count if deep_count > 0 else 0
-            deep_recall = min(deep_count, gt_count) / gt_count if gt_count > 0 else 0
-            deep_f1 = 2 * (deep_precision * deep_recall) / (deep_precision + deep_recall) if (deep_precision + deep_recall) > 0 else 0
-            
+            quick_precision = min(quick_count, gt_count) / \
+                quick_count if quick_count > 0 else 0
+            quick_recall = min(quick_count, gt_count) / \
+                gt_count if gt_count > 0 else 0
+            quick_f1 = 2 * (quick_precision * quick_recall) / (quick_precision +
+                                                               quick_recall) if (quick_precision + quick_recall) > 0 else 0
+
+            deep_precision = min(deep_count, gt_count) / \
+                deep_count if deep_count > 0 else 0
+            deep_recall = min(deep_count, gt_count) / \
+                gt_count if gt_count > 0 else 0
+            deep_f1 = 2 * (deep_precision * deep_recall) / (deep_precision +
+                                                            deep_recall) if (deep_precision + deep_recall) > 0 else 0
+
             x = np.arange(3)
             width = 0.35
-            
+
             quick_metrics = [quick_precision, quick_recall, quick_f1]
             deep_metrics = [deep_precision, deep_recall, deep_f1]
-            
-            bars1 = ax2.bar(x - width/2, quick_metrics, width, label='Quick', color='#2196F3', alpha=0.8)
-            bars2 = ax2.bar(x + width/2, deep_metrics, width, label='Deep', color='#4CAF50', alpha=0.8)
-            
+
+            bars1 = ax2.bar(x - width/2, quick_metrics, width,
+                            label='Quick', color='#2196F3', alpha=0.8)
+            bars2 = ax2.bar(x + width/2, deep_metrics, width,
+                            label='Deep', color='#4CAF50', alpha=0.8)
+
             ax2.set_ylabel('Score', fontsize=11, fontweight='bold')
-            ax2.set_title('Performance Metrics vs Ground Truth', fontsize=12, fontweight='bold')
+            ax2.set_title('Performance Metrics vs Ground Truth',
+                          fontsize=12, fontweight='bold')
             ax2.set_xticks(x)
-            ax2.set_xticklabels(['Precision', 'Recall', 'F1-Score'], fontsize=9)
+            ax2.set_xticklabels(
+                ['Precision', 'Recall', 'F1-Score'], fontsize=9)
             ax2.legend(fontsize=9)
             ax2.grid(True, alpha=0.3, axis='y')
             ax2.set_ylim(0, 1.1)
-            
+
             # Add value labels
             for bars in [bars1, bars2]:
                 for bar in bars:
                     height = bar.get_height()
                     ax2.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                            f'{height:.2f}', ha='center', va='bottom', fontsize=8)
+                             f'{height:.2f}', ha='center', va='bottom', fontsize=8)
         else:
-            ax2.text(0.5, 0.5, 'No Ground Truth\nAvailable', 
-                    ha='center', va='center', fontsize=12, transform=ax2.transAxes)
-            ax2.set_title('Performance Metrics', fontsize=12, fontweight='bold')
-        
+            ax2.text(0.5, 0.5, 'No Ground Truth\nAvailable',
+                     ha='center', va='center', fontsize=12, transform=ax2.transAxes)
+            ax2.set_title('Performance Metrics',
+                          fontsize=12, fontweight='bold')
+
         # 3. Shape Distribution Comparison
-        quick_shapes = Counter([f['shape'] for f in quick_result.features]) if quick_result.features else {}
-        deep_shapes = Counter([f['shape'] for f in deep_result.features]) if deep_result.features else {}
-        
+        quick_shapes = Counter(
+            [f['shape'] for f in quick_result.features]) if quick_result.features else {}
+        deep_shapes = Counter(
+            [f['shape'] for f in deep_result.features]) if deep_result.features else {}
+
         # Add ground truth shapes if available
         if self.ground_truth and len(self.ground_truth) > 0:
             # Map ground truth shapes to grouped names
-            gt_shapes = Counter([map_to_grouped_shape(p['shape']) for p in self.ground_truth])
-            all_shapes = sorted(set(list(quick_shapes.keys()) + list(deep_shapes.keys()) + list(gt_shapes.keys())))
+            gt_shapes = Counter([map_to_grouped_shape(p['shape'])
+                                for p in self.ground_truth])
+            all_shapes = sorted(set(
+                list(quick_shapes.keys()) + list(deep_shapes.keys()) + list(gt_shapes.keys())))
         else:
             gt_shapes = None
-            all_shapes = sorted(set(list(quick_shapes.keys()) + list(deep_shapes.keys())))
-        
+            all_shapes = sorted(
+                set(list(quick_shapes.keys()) + list(deep_shapes.keys())))
+
         if all_shapes:
             x = np.arange(len(all_shapes))
             width = 0.25 if gt_shapes else 0.35
-            
+
             quick_counts = [quick_shapes.get(shape, 0) for shape in all_shapes]
             deep_counts = [deep_shapes.get(shape, 0) for shape in all_shapes]
-            
+
             if gt_shapes:
                 # 3-way comparison
                 gt_counts = [gt_shapes.get(shape, 0) for shape in all_shapes]
-                ax3.bar(x - width, quick_counts, width, label='Quick', color='#2196F3', alpha=0.8)
-                ax3.bar(x, deep_counts, width, label='Deep', color='#4CAF50', alpha=0.8)
-                ax3.bar(x + width, gt_counts, width, label='Ground Truth', color='#FF5722', alpha=0.8)
+                ax3.bar(x - width, quick_counts, width,
+                        label='Quick', color='#2196F3', alpha=0.8)
+                ax3.bar(x, deep_counts, width, label='Deep',
+                        color='#4CAF50', alpha=0.8)
+                ax3.bar(x + width, gt_counts, width,
+                        label='Ground Truth', color='#FF5722', alpha=0.8)
             else:
                 # 2-way comparison
-                ax3.bar(x - width/2, quick_counts, width, label='Quick', color='#2196F3', alpha=0.8)
-                ax3.bar(x + width/2, deep_counts, width, label='Deep', color='#4CAF50', alpha=0.8)
-            
+                ax3.bar(x - width/2, quick_counts, width,
+                        label='Quick', color='#2196F3', alpha=0.8)
+                ax3.bar(x + width/2, deep_counts, width,
+                        label='Deep', color='#4CAF50', alpha=0.8)
+
             ax3.set_ylabel('Count', fontsize=11, fontweight='bold')
-            ax3.set_title('Shape Distribution Comparison', fontsize=12, fontweight='bold')
+            ax3.set_title('Shape Distribution Comparison',
+                          fontsize=12, fontweight='bold')
             ax3.set_xticks(x)
-            ax3.set_xticklabels(all_shapes, rotation=45, ha='right', fontsize=9)
+            ax3.set_xticklabels(all_shapes, rotation=45,
+                                ha='right', fontsize=9)
             ax3.legend(fontsize=9)
             ax3.grid(True, alpha=0.3, axis='y')
         else:
-            ax3.text(0.5, 0.5, 'No Particles\nDetected', 
-                    ha='center', va='center', fontsize=12, transform=ax3.transAxes)
+            ax3.text(0.5, 0.5, 'No Particles\nDetected',
+                     ha='center', va='center', fontsize=12, transform=ax3.transAxes)
             ax3.set_title('Shape Distribution', fontsize=12, fontweight='bold')
-        
+
         # 4. Color Distribution Comparison
-        quick_colors = Counter([f['color'] for f in quick_result.features]) if quick_result.features else {}
-        deep_colors = Counter([f['color'] for f in deep_result.features]) if deep_result.features else {}
-        
+        quick_colors = Counter(
+            [f['color'] for f in quick_result.features]) if quick_result.features else {}
+        deep_colors = Counter(
+            [f['color'] for f in deep_result.features]) if deep_result.features else {}
+
         # Add ground truth colors if available
         if self.ground_truth and len(self.ground_truth) > 0:
             gt_colors = Counter([p['color_label'] for p in self.ground_truth])
-            all_colors = sorted(set(list(quick_colors.keys()) + list(deep_colors.keys()) + list(gt_colors.keys())))
+            all_colors = sorted(set(
+                list(quick_colors.keys()) + list(deep_colors.keys()) + list(gt_colors.keys())))
         else:
             gt_colors = None
-            all_colors = sorted(set(list(quick_colors.keys()) + list(deep_colors.keys())))
-        
+            all_colors = sorted(
+                set(list(quick_colors.keys()) + list(deep_colors.keys())))
+
         if all_colors:
             x = np.arange(len(all_colors))
             width = 0.25 if gt_colors else 0.35
-            
-            quick_color_counts = [quick_colors.get(color, 0) for color in all_colors]
-            deep_color_counts = [deep_colors.get(color, 0) for color in all_colors]
-            
+
+            quick_color_counts = [quick_colors.get(
+                color, 0) for color in all_colors]
+            deep_color_counts = [deep_colors.get(
+                color, 0) for color in all_colors]
+
             if gt_colors:
                 # 3-way comparison
-                gt_color_counts = [gt_colors.get(color, 0) for color in all_colors]
-                ax4.bar(x - width, quick_color_counts, width, label='Quick', color='#2196F3', alpha=0.8)
-                ax4.bar(x, deep_color_counts, width, label='Deep', color='#4CAF50', alpha=0.8)
-                ax4.bar(x + width, gt_color_counts, width, label='Ground Truth', color='#FF5722', alpha=0.8)
+                gt_color_counts = [gt_colors.get(
+                    color, 0) for color in all_colors]
+                ax4.bar(x - width, quick_color_counts, width,
+                        label='Quick', color='#2196F3', alpha=0.8)
+                ax4.bar(x, deep_color_counts, width,
+                        label='Deep', color='#4CAF50', alpha=0.8)
+                ax4.bar(x + width, gt_color_counts, width,
+                        label='Ground Truth', color='#FF5722', alpha=0.8)
             else:
                 # 2-way comparison
-                ax4.bar(x - width/2, quick_color_counts, width, label='Quick', color='#2196F3', alpha=0.8)
-                ax4.bar(x + width/2, deep_color_counts, width, label='Deep', color='#4CAF50', alpha=0.8)
-            
+                ax4.bar(x - width/2, quick_color_counts, width,
+                        label='Quick', color='#2196F3', alpha=0.8)
+                ax4.bar(x + width/2, deep_color_counts, width,
+                        label='Deep', color='#4CAF50', alpha=0.8)
+
             ax4.set_ylabel('Count', fontsize=11, fontweight='bold')
-            ax4.set_title('Color Distribution Comparison', fontsize=12, fontweight='bold')
+            ax4.set_title('Color Distribution Comparison',
+                          fontsize=12, fontweight='bold')
             ax4.set_xticks(x)
-            ax4.set_xticklabels(all_colors, rotation=45, ha='right', fontsize=9)
+            ax4.set_xticklabels(all_colors, rotation=45,
+                                ha='right', fontsize=9)
             ax4.legend(fontsize=9)
             ax4.grid(True, alpha=0.3, axis='y')
         else:
-            ax4.text(0.5, 0.5, 'No Particles\nDetected', 
-                    ha='center', va='center', fontsize=12, transform=ax4.transAxes)
+            ax4.text(0.5, 0.5, 'No Particles\nDetected',
+                     ha='center', va='center', fontsize=12, transform=ax4.transAxes)
             ax4.set_title('Color Distribution', fontsize=12, fontweight='bold')
-        
+
         # 5. Area (Object Pixels) Distribution Comparison
-        quick_areas = [f['area'] for f in quick_result.features] if quick_result.features else []
-        deep_areas = [f['area'] for f in deep_result.features] if deep_result.features else []
-        
+        quick_areas = [f['area']
+                       for f in quick_result.features] if quick_result.features else []
+        deep_areas = [f['area']
+                      for f in deep_result.features] if deep_result.features else []
+
         # Add ground truth areas if available
         if self.ground_truth and len(self.ground_truth) > 0:
             gt_areas = [p['area'] for p in self.ground_truth]
         else:
             gt_areas = []
-        
+
         if quick_areas or deep_areas or gt_areas:
             # Create histogram bins
             all_areas = quick_areas + deep_areas + gt_areas
             if all_areas:
                 bins = np.linspace(min(all_areas), max(all_areas), 15)
-                
-                ax5.hist(quick_areas, bins=bins, alpha=0.5, label='Quick', color='#2196F3', edgecolor='black')
-                ax5.hist(deep_areas, bins=bins, alpha=0.5, label='Deep', color='#4CAF50', edgecolor='black')
+
+                ax5.hist(quick_areas, bins=bins, alpha=0.5,
+                         label='Quick', color='#2196F3', edgecolor='black')
+                ax5.hist(deep_areas, bins=bins, alpha=0.5,
+                         label='Deep', color='#4CAF50', edgecolor='black')
                 if gt_areas:
-                    ax5.hist(gt_areas, bins=bins, alpha=0.5, label='Ground Truth', color='#FF5722', edgecolor='black')
-                
+                    ax5.hist(gt_areas, bins=bins, alpha=0.5,
+                             label='Ground Truth', color='#FF5722', edgecolor='black')
+
                 ax5.set_xlabel('Area (pixels)', fontsize=11, fontweight='bold')
                 ax5.set_ylabel('Frequency', fontsize=11, fontweight='bold')
-                ax5.set_title('Object Pixel Area Distribution', fontsize=12, fontweight='bold')
+                ax5.set_title('Object Pixel Area Distribution',
+                              fontsize=12, fontweight='bold')
                 ax5.legend(fontsize=9)
                 ax5.grid(True, alpha=0.3, axis='y')
-                
+
                 # Add statistics
                 if quick_areas:
                     quick_mean = np.mean(quick_areas)
-                    ax5.axvline(quick_mean, color='#2196F3', linestyle='--', linewidth=2, alpha=0.7)
+                    ax5.axvline(quick_mean, color='#2196F3',
+                                linestyle='--', linewidth=2, alpha=0.7)
                 if deep_areas:
                     deep_mean = np.mean(deep_areas)
-                    ax5.axvline(deep_mean, color='#4CAF50', linestyle='--', linewidth=2, alpha=0.7)
+                    ax5.axvline(deep_mean, color='#4CAF50',
+                                linestyle='--', linewidth=2, alpha=0.7)
                 if gt_areas:
                     gt_mean = np.mean(gt_areas)
-                    ax5.axvline(gt_mean, color='#FF5722', linestyle='--', linewidth=2, alpha=0.7)
+                    ax5.axvline(gt_mean, color='#FF5722',
+                                linestyle='--', linewidth=2, alpha=0.7)
         else:
-            ax5.text(0.5, 0.5, 'No Particles\nDetected', 
-                    ha='center', va='center', fontsize=12, transform=ax5.transAxes)
-            ax5.set_title('Object Pixel Area Distribution', fontsize=12, fontweight='bold')
-        
+            ax5.text(0.5, 0.5, 'No Particles\nDetected',
+                     ha='center', va='center', fontsize=12, transform=ax5.transAxes)
+            ax5.set_title('Object Pixel Area Distribution',
+                          fontsize=12, fontweight='bold')
+
         # 6. Processing Time Comparison (only Quick and Deep, no ground truth time)
         time_methods = ['Quick', 'Deep']
         times = [quick_result.processing_time, deep_result.processing_time]
         time_colors = ['#2196F3', '#4CAF50']
-        bars = ax6.bar(time_methods, times, color=time_colors, alpha=0.8, edgecolor='black', linewidth=2)
-        
+        bars = ax6.bar(time_methods, times, color=time_colors,
+                       alpha=0.8, edgecolor='black', linewidth=2)
+
         ax6.set_ylabel('Time (seconds)', fontsize=11, fontweight='bold')
-        ax6.set_title('Processing Time Comparison', fontsize=12, fontweight='bold')
+        ax6.set_title('Processing Time Comparison',
+                      fontsize=12, fontweight='bold')
         ax6.grid(True, alpha=0.3, axis='y')
-        
+
         for bar, time_val in zip(bars, times):
             height = bar.get_height()
             ax6.text(bar.get_x() + bar.get_width()/2., height + max(times) * 0.02,
-                    f'{time_val:.2f}s', ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
+                     f'{time_val:.2f}s', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
         self.figure.tight_layout()
         self.canvas.draw()
-        
+
         # Switch to Statistics tab to show the charts
         self.tabs.setCurrentIndex(3)
-    
+
     def create_comprehensive_comparison_charts(self):
         """Create comprehensive comparison charts for all available methods"""
         self.figure.clear()
-        
+
         # Get all methods and their data
         methods = self.stats_comparator.get_all_methods()
         num_methods = len(methods)
-        
+
         if num_methods < 2:
             return
-        
+
         # Create subplot layout (2x2 grid - 4 main graphs)
         gs = self.figure.add_gridspec(2, 2, hspace=0.35, wspace=0.35)
         ax1 = self.figure.add_subplot(gs[0, 0])  # Detection counts
         ax2 = self.figure.add_subplot(gs[0, 1])  # Color distribution
         ax3 = self.figure.add_subplot(gs[1, 0])  # Shape distribution
         ax4 = self.figure.add_subplot(gs[1, 1])  # 3D Morphometric parameters
-        
+
         # Color scheme for different methods
         color_map = {
             'Quick Analysis': '#2196F3',
@@ -1926,37 +2413,41 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             'ML Benchmark': '#9C27B0',
             'Synthetic Ground Truth': '#FF5722'
         }
-        
+
         # 1. Detection Counts
         comparison_table = self.stats_comparator.get_comparison_table()
         counts = [comparison_table[m]['num_detections'] for m in methods]
         colors = [color_map.get(m, '#757575') for m in methods]
-        
-        bars = ax1.bar(range(len(methods)), counts, color=colors, alpha=0.8, edgecolor='black', linewidth=2)
+
+        bars = ax1.bar(range(len(methods)), counts, color=colors,
+                       alpha=0.8, edgecolor='black', linewidth=2)
         ax1.set_ylabel('Detection Count', fontsize=11, fontweight='bold')
-        ax1.set_title('Detection Count Comparison', fontsize=12, fontweight='bold')
+        ax1.set_title('Detection Count Comparison',
+                      fontsize=12, fontweight='bold')
         ax1.set_xticks(range(len(methods)))
-        ax1.set_xticklabels([m.replace(' ', '\n') for m in methods], fontsize=9)
+        ax1.set_xticklabels([m.replace(' ', '\n')
+                            for m in methods], fontsize=9)
         ax1.grid(True, alpha=0.3, axis='y')
-        
+
         for bar, count in zip(bars, counts):
             height = bar.get_height()
             ax1.text(bar.get_x() + bar.get_width()/2., height + max(counts) * 0.02,
-                    f'{int(count)}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
+                     f'{int(count)}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
         # 2. Color Distribution (Stacked Bar Chart for 4 fluorescent colors)
         color_data = self.stats_comparator.get_parameter_comparison('color')
         if color_data:
             # Count 4 main colors: Red, Green, Blue, Yellow
             main_colors = ['Red', 'Green', 'Blue', 'Yellow']
-            color_counts = {method: {c: 0 for c in main_colors} for method in methods}
-            
+            color_counts = {method: {c: 0 for c in main_colors}
+                            for method in methods}
+
             for method in methods:
                 if method in color_data:
                     from collections import Counter
                     colors_list = color_data[method]
                     color_counter = Counter(colors_list)
-                    
+
                     for color_name, count in color_counter.items():
                         # Map to 4 main colors
                         if 'Red' in color_name or 'Pink' in color_name or 'Orange' in color_name:
@@ -1967,61 +2458,71 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                             color_counts[method]['Blue'] += count
                         elif 'Yellow' in color_name:
                             color_counts[method]['Yellow'] += count
-            
+
             # Create stacked bar chart
             x_pos = np.arange(len(methods))
             bar_width = 0.6
-            
+
             # Color mapping for visual representation
-            visual_colors = {'Red': '#FF0000', 'Green': '#00FF00', 'Blue': '#0000FF', 'Yellow': '#FFFF00'}
-            
+            visual_colors = {'Red': '#FF0000', 'Green': '#00FF00',
+                             'Blue': '#0000FF', 'Yellow': '#FFFF00'}
+
             bottom = np.zeros(len(methods))
             for color_name in main_colors:
-                counts_for_color = [color_counts[m][color_name] for m in methods]
+                counts_for_color = [color_counts[m][color_name]
+                                    for m in methods]
                 ax2.bar(x_pos, counts_for_color, bar_width, label=color_name,
-                       bottom=bottom, color=visual_colors[color_name], alpha=0.8,
-                       edgecolor='black', linewidth=1)
+                        bottom=bottom, color=visual_colors[color_name], alpha=0.8,
+                        edgecolor='black', linewidth=1)
                 bottom += counts_for_color
-            
+
             ax2.set_ylabel('Count', fontsize=11, fontweight='bold')
-            ax2.set_title('Color Distribution (4 Fluorescent Colors)', fontsize=12, fontweight='bold')
+            ax2.set_title('Color Distribution (4 Fluorescent Colors)',
+                          fontsize=12, fontweight='bold')
             ax2.set_xticks(x_pos)
-            ax2.set_xticklabels([m.replace(' ', '\n') for m in methods], fontsize=9)
+            ax2.set_xticklabels([m.replace(' ', '\n')
+                                for m in methods], fontsize=9)
             ax2.legend(loc='upper right', fontsize=9)
             ax2.grid(True, alpha=0.3, axis='y')
-        
+
         # 3. Shape Distribution Comparison
         all_shapes = set()
         for method in methods:
             shapes = comparison_table[method]['shapes']
             all_shapes.update(shapes.keys())
         all_shapes = sorted(all_shapes)
-        
+
         if all_shapes:
             x = np.arange(len(all_shapes))
             width = 0.8 / num_methods
-            
+
             for i, method in enumerate(methods):
                 shapes = comparison_table[method]['shapes']
                 counts = [shapes.get(shape, 0) for shape in all_shapes]
                 offset = (i - num_methods/2 + 0.5) * width
                 ax3.bar(x + offset, counts, width, label=method.replace(' Analysis', '').replace(' Benchmark', ''),
-                       color=color_map.get(method, '#757575'), alpha=0.7)
-            
+                        color=color_map.get(method, '#757575'), alpha=0.7)
+
             ax3.set_ylabel('Count', fontsize=11, fontweight='bold')
-            ax3.set_title('Shape Distribution Comparison', fontsize=12, fontweight='bold')
+            ax3.set_title('Shape Distribution Comparison',
+                          fontsize=12, fontweight='bold')
             ax3.set_xticks(x)
-            ax3.set_xticklabels(all_shapes, rotation=45, ha='right', fontsize=9)
+            ax3.set_xticklabels(all_shapes, rotation=45,
+                                ha='right', fontsize=9)
             ax3.legend(fontsize=9, loc='upper right')
             ax3.grid(True, alpha=0.3, axis='y')
-        
+
         # 4. 3D Morphometric Parameters (Circularity, Aspect Ratio, Eccentricity)
-        circ_data = self.stats_comparator.get_parameter_comparison('circularity')
-        aspect_data = self.stats_comparator.get_parameter_comparison('aspect_ratio')
-        ecc_data = self.stats_comparator.get_parameter_comparison('eccentricity')
-        
-        has_data = any(circ_data.get(m, []) and aspect_data.get(m, []) and ecc_data.get(m, []) for m in methods)
-        
+        circ_data = self.stats_comparator.get_parameter_comparison(
+            'circularity')
+        aspect_data = self.stats_comparator.get_parameter_comparison(
+            'aspect_ratio')
+        ecc_data = self.stats_comparator.get_parameter_comparison(
+            'eccentricity')
+
+        has_data = any(circ_data.get(m, []) and aspect_data.get(
+            m, []) and ecc_data.get(m, []) for m in methods)
+
         if has_data:
             for method in methods:
                 if method in circ_data and method in aspect_data and method in ecc_data:
@@ -2030,52 +2531,57 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         circs = circ_data[method][:100]
                         aspects = aspect_data[method][:100]
                         eccs = ecc_data[method][:100]
-                        
-                        ax4.scatter(circs, aspects, eccs, 
-                                   label=method.replace(' Analysis', '').replace(' Benchmark', ''),
-                                   alpha=0.6, s=20, color=color_map.get(method, '#757575'))
-            
+
+                        ax4.scatter(circs, aspects, eccs,
+                                    label=method.replace(' Analysis', '').replace(
+                                        ' Benchmark', ''),
+                                    alpha=0.6, s=20, color=color_map.get(method, '#757575'))
+
             ax4.set_xlabel('Circularity', fontsize=9)
             ax4.set_ylabel('Aspect Ratio', fontsize=9)
             ax4.set_zlabel('Eccentricity', fontsize=9)
-            ax4.set_title('3D Morphometric Parameters', fontsize=11, fontweight='bold')
+            ax4.set_title('3D Morphometric Parameters',
+                          fontsize=11, fontweight='bold')
             ax4.legend(fontsize=8, loc='upper left')
             ax4.view_init(elev=20, azim=45)
         else:
             # If no 3D data, show text message
-            ax4.text2D(0.5, 0.5, 'Morphometric data\nnot available', 
-                      ha='center', va='center', fontsize=10, transform=ax4.transAxes)
-            ax4.set_title('3D Morphometric Parameters', fontsize=11, fontweight='bold')
-        
+            ax4.text2D(0.5, 0.5, 'Morphometric data\nnot available',
+                       ha='center', va='center', fontsize=10, transform=ax4.transAxes)
+            ax4.set_title('3D Morphometric Parameters',
+                          fontsize=11, fontweight='bold')
+
         self.figure.tight_layout()
         self.canvas.draw()
-        
+
         # Switch to Statistics tab
         self.tabs.setCurrentIndex(3)
-        
+
     def run_benchmark(self):
         """Run comprehensive benchmarking with batch image processing"""
         # Ask user: single image or batch processing
         from PyQt5.QtWidgets import QInputDialog
-        
-        items = ["Single Image (Current)", "Batch Processing (Multiple Images)"]
-        item, ok = QInputDialog.getItem(self, "Benchmark Mode", 
-                                       "Select benchmark mode:", items, 0, False)
-        
+
+        items = ["Single Image (Current)",
+                 "Batch Processing (Multiple Images)"]
+        item, ok = QInputDialog.getItem(self, "Benchmark Mode",
+                                        "Select benchmark mode:", items, 0, False)
+
         if not ok:
             return
-        
+
         if "Single" in item:
             self._run_single_benchmark()
         else:
             self._run_batch_benchmark()
-    
+
     def _run_single_benchmark(self):
         """Run benchmark on current single image"""
         if self.current_image is None:
-            QMessageBox.warning(self, "Warning", "Please load or generate an image first")
+            QMessageBox.warning(
+                self, "Warning", "Please load or generate an image first")
             return
-            
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.statusBar().showMessage('Running benchmark...')
@@ -2085,14 +2591,15 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.results_text.append("=" * 60)
         self.results_text.append("\nComparing Quick vs Deep analysis methods")
         if self.ground_truth_count > 0:
-            self.results_text.append(f"Ground Truth: {self.ground_truth_count} particles\n")
-        
+            self.results_text.append(
+                f"Ground Truth: {self.ground_truth_count} particles\n")
+
         import time
         import numpy as np
         from datetime import datetime
         from collections import Counter
         from src.analysis.report_generator import ReportGenerator
-        
+
         # Store comprehensive benchmark results
         benchmark_data = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -2106,43 +2613,45 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             'deep_analysis': {},
             'watershed_analysis': {}
         }
-        
+
         # Run Quick Analysis
         self.results_text.append("\n[1/3] Running Quick Analysis...")
         QApplication.processEvents()
-        
+
         quick_params = self.get_analysis_params('quick')
         start_time = time.time()
         quick_analyzer = QuickAnalyzer()
         quick_result = quick_analyzer.analyze(self.current_image, quick_params)
         quick_time = time.time() - start_time
-        
+
         # Calculate metrics for Quick
         quick_metrics = self._calculate_metrics(quick_result, 'Quick')
         benchmark_data['quick_analysis'] = quick_metrics
-        
-        self.results_text.append(f"  Detected: {quick_result.num_detections} particles in {quick_time:.3f}s")
-        
+
+        self.results_text.append(
+            f"  Detected: {quick_result.num_detections} particles in {quick_time:.3f}s")
+
         # Run Deep Analysis
         self.results_text.append("\n[2/3] Running Deep Analysis...")
         QApplication.processEvents()
-        
+
         deep_params = self.get_analysis_params('deep')
         start_time = time.time()
         deep_analyzer = DeepAnalyzer()
         deep_result = deep_analyzer.analyze(self.current_image, deep_params)
         deep_time = time.time() - start_time
-        
+
         # Calculate metrics for Deep
         deep_metrics = self._calculate_metrics(deep_result, 'Deep')
         benchmark_data['deep_analysis'] = deep_metrics
-        
-        self.results_text.append(f"  Detected: {deep_result.num_detections} particles in {deep_time:.3f}s")
-        
+
+        self.results_text.append(
+            f"  Detected: {deep_result.num_detections} particles in {deep_time:.3f}s")
+
         # Run Watershed (if different from Deep)
         self.results_text.append("\n[3/3] Running Watershed Analysis...")
         QApplication.processEvents()
-        
+
         watershed_params = PreprocessingParams(
             method='watershed',
             min_area=deep_params.min_area,
@@ -2152,33 +2661,38 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             marker_size=deep_params.marker_size
         )
         start_time = time.time()
-        watershed_result = deep_analyzer.analyze(self.current_image, watershed_params)
+        watershed_result = deep_analyzer.analyze(
+            self.current_image, watershed_params)
         watershed_time = time.time() - start_time
-        
+
         # Calculate metrics for Watershed
-        watershed_metrics = self._calculate_metrics(watershed_result, 'Watershed')
+        watershed_metrics = self._calculate_metrics(
+            watershed_result, 'Watershed')
         benchmark_data['watershed_analysis'] = watershed_metrics
-        
-        self.results_text.append(f"  Detected: {watershed_result.num_detections} particles in {watershed_time:.3f}s")
-        
+
+        self.results_text.append(
+            f"  Detected: {watershed_result.num_detections} particles in {watershed_time:.3f}s")
+
         # Display summary
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("BENCHMARK SUMMARY")
         self.results_text.append("=" * 60)
-        
+
         for method_name, metrics in [('Quick', quick_metrics), ('Deep', deep_metrics), ('Watershed', watershed_metrics)]:
             self.results_text.append(f"\n{method_name} Analysis:")
             self.results_text.append(f"  Detected: {metrics['detected']}")
-            self.results_text.append(f"  Precision: {metrics['precision']:.3f}")
+            self.results_text.append(
+                f"  Precision: {metrics['precision']:.3f}")
             self.results_text.append(f"  Recall: {metrics['recall']:.3f}")
             self.results_text.append(f"  F1-Score: {metrics['f1_score']:.3f}")
-            self.results_text.append(f"  Time: {metrics['processing_time']:.3f}s")
-        
+            self.results_text.append(
+                f"  Time: {metrics['processing_time']:.3f}s")
+
         # Generate HTML report
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("GENERATING HTML REPORT...")
         QApplication.processEvents()
-        
+
         try:
             # Extract ground truth distributions if available
             # Filter to only fluorescent colors and grouped shapes
@@ -2189,7 +2703,8 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             if self.ground_truth and len(self.ground_truth) > 0:
                 for particle in self.ground_truth:
                     # Map to grouped shape categories
-                    shape = map_to_grouped_shape(particle.get('shape', 'Unknown'))
+                    shape = map_to_grouped_shape(
+                        particle.get('shape', 'Unknown'))
                     gt_shapes[shape] += 1
                     # Filter to only fluorescent colors
                     color = particle.get('color_label', 'Unknown')
@@ -2197,7 +2712,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         gt_colors[color] += 1
                     if 'area' in particle:
                         gt_areas.append(particle['area'])
-            
+
             # Add ground truth distributions to benchmark data
             if gt_shapes or gt_colors or gt_areas:
                 benchmark_data['ground_truth_distributions'] = {
@@ -2205,59 +2720,61 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     'color_distribution': dict(gt_colors),
                     'area_distribution': gt_areas
                 }
-            
+
             report_gen = ReportGenerator()
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             output_dir = Path('benchmark_results')
             output_dir.mkdir(exist_ok=True)
-            
+
             html_path = output_dir / f'benchmark_report_{timestamp}.html'
-            report_gen.generate_benchmark_report(benchmark_data, str(html_path))
-            
+            report_gen.generate_benchmark_report(
+                benchmark_data, str(html_path))
+
             self.results_text.append(f"\n✓ HTML Report saved: {html_path}")
             self.results_text.append("\nOpening report in browser...")
-            
+
             # Open in browser
             import webbrowser
+            self.results_text.append(f"Replay evidence saved: {snapshot_path}")
             webbrowser.open(f'file:///{html_path.absolute()}')
-            
+
         except Exception as e:
             self.results_text.append(f"\n✗ Failed to generate report: {e}")
             import traceback
             traceback.print_exc()
-        
+
         self.progress_bar.setVisible(False)
         self.statusBar().showMessage('Benchmark complete - Report generated')
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("BENCHMARK COMPLETE")
         self.results_text.append("=" * 60)
-    
+
     def _find_ground_truth_file(self, img_path):
         """
         Find ground truth file for an image, checking multiple locations.
-        
+
         Checks:
         1. Same directory as image: <imagename>_groundtruth.txt
         2. Parallel ground_truth directory (for YOLO datasets): ground_truth/<split>/<imagename>_groundtruth.txt
-        
+
         Args:
             img_path: Path object for the image file
-            
+
         Returns:
             Path object for ground truth file, or None if not found
         """
         from pathlib import Path
-        
+
         # Try same directory first
         gt_path = img_path.parent / f"{img_path.stem}_groundtruth.txt"
-        
+
         if gt_path.exists():
             return gt_path
-        
+
         # Try parallel ground_truth directory structure
         # e.g., yolo_microplastic_dataset/images/train/img.png -> yolo_microplastic_dataset/ground_truth/train/img_groundtruth.txt
         parent = img_path.parent  # e.g., images/train/
-        
+
         # Check if parent directory is named like a split (train/val/test) and grandparent is 'images'
         if parent.parent and parent.parent.name == 'images':
             # Found: .../images/train/ structure
@@ -2265,37 +2782,39 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             dataset_root = parent.parent.parent  # Go up to dataset root
             gt_dir = dataset_root / 'ground_truth' / split_name
             gt_path_alt = gt_dir / f"{img_path.stem}_groundtruth.txt"
-            
+
             if gt_path_alt.exists():
-                print(f"DEBUG: Found ground truth in parallel structure: {gt_path_alt}")
+                logger.debug(f"DEBUG: Found ground truth in parallel structure: {gt_path_alt}")
                 return gt_path_alt
-        
+
         # Alternative: check if parent's parent contains 'dataset' in name (legacy support)
         parent_name = parent.parent.name if parent.parent else ""
         if parent_name and ('dataset' in parent_name.lower() or parent_name in ['yolo_microplastic_dataset']):
             split_name = parent.name
             gt_dir = parent.parent / 'ground_truth' / split_name
             gt_path_alt = gt_dir / f"{img_path.stem}_groundtruth.txt"
-            
+
             if gt_path_alt.exists():
-                print(f"DEBUG: Found ground truth in legacy structure: {gt_path_alt}")
+                logger.debug(f"DEBUG: Found ground truth in legacy structure: {gt_path_alt}")
                 return gt_path_alt
-        
+
         return None
-    
+
     def _run_batch_benchmark(self):
         """Run benchmark on multiple images (batch processing)"""
         # Ask for image folder or generate synthetic images
         from PyQt5.QtWidgets import QInputDialog
-        
+
         items = ["Load Image Folder", "Generate 200 Synthetic Images"]
-        item, ok = QInputDialog.getItem(self, "Batch Source", 
-                                       "Select image source:", items, 0, False)
-        
+        item, ok = QInputDialog.getItem(self, "Batch Source",
+                                        "Select image source:", items, 0, False)
+
         if not ok:
             return
-        
+
         images_data = []
+        source_kind = 'generated'
+        source_folder = None
         
         if "Generate" in item:
             # Generate synthetic images
@@ -2303,39 +2822,41 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                                                  "How many synthetic images?", 200, 1, 1000, 10)
             if not ok:
                 return
-            
+
             # Ask if user wants to save images
             from PyQt5.QtWidgets import QMessageBox
             from datetime import datetime
             from pathlib import Path
-            
-            save_reply = QMessageBox.question(self, 'Save Images?', 
-                                             'Do you want to save generated images to disk?\n\n'
-                                             'Yes: Save to benchmark_results/images/\n'
-                                             'No: Process in memory only (faster)',
-                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+
+            save_reply = QMessageBox.question(self, 'Save Images?',
+                                              'Do you want to save generated images to disk?\n\n'
+                                              'Yes: Save to benchmark_results/images/\n'
+                                              'No: Process in memory only (faster)',
+                                              QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             save_images = (save_reply == QMessageBox.Yes)
-            
+
             # Create output directory if saving
             image_output_dir = None
             if save_images:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                image_output_dir = Path('benchmark_results') / 'images' / f'batch_{timestamp}'
+                image_output_dir = Path(
+                    'benchmark_results') / 'images' / f'batch_{timestamp}'
                 image_output_dir.mkdir(parents=True, exist_ok=True)
-                self.results_text.append(f"Images will be saved to: {image_output_dir}")
-            
+                self.results_text.append(
+                    f"Images will be saved to: {image_output_dir}")
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, num_images)
             self.statusBar().showMessage('Generating synthetic images...')
-            
+
             from src.data_generation import SyntheticImageGenerator
             from config.settings import SyntheticImageParams
             generator = SyntheticImageGenerator()
-            
+
             for i in range(num_images):
                 self.progress_bar.setValue(i)
                 QApplication.processEvents()
-                
+
                 # Generate with parameters from GUI interface
                 import random
                 params = SyntheticImageParams(
@@ -2351,9 +2872,9 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     background_brightness=self.synth_brightness.value(),
                     particle_brightness=self.synth_particle_brightness.value()
                 )
-                
+
                 image, ground_truth = generator.generate(params)
-                
+
                 # Save image to disk if requested
                 if save_images and image_output_dir:
                     img_filename = f'synthetic_{i+1:03d}.png'
@@ -2361,7 +2882,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     # Convert RGB to BGR for OpenCV
                     image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
                     cv2.imwrite(str(img_path), image_bgr)
-                    
+
                     # Save ground truth metadata with FULL details (shape, color, area, etc.)
                     gt_filename = f'synthetic_{i+1:03d}_groundtruth.txt'
                     gt_path = image_output_dir / gt_filename
@@ -2369,81 +2890,92 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         f.write(f"Total Particles: {len(ground_truth)}\n\n")
                         for idx, particle in enumerate(ground_truth, 1):
                             f.write(f"Particle {idx}:\n")
-                            f.write(f"  Shape: {particle.get('shape', 'Unknown')}\n")
-                            f.write(f"  Color: {particle.get('color_label', 'Unknown')}\n")
+                            f.write(
+                                f"  Shape: {particle.get('shape', 'Unknown')}\n")
+                            f.write(
+                                f"  Color: {particle.get('color_label', 'Unknown')}\n")
                             if 'wavelength' in particle:
-                                f.write(f"  Wavelength: {particle['wavelength']}nm\n")
+                                f.write(
+                                    f"  Wavelength: {particle['wavelength']}nm\n")
                             if 'position' in particle:
                                 pos = particle['position']
                                 f.write(f"  Position: ({pos[0]}, {pos[1]})\n")
                             if 'area' in particle:
-                                f.write(f"  Area: {particle['area']:.2f} px²\n")
+                                f.write(
+                                    f"  Area: {particle['area']:.2f} px²\n")
                             if 'size' in particle:
                                 f.write(f"  Size: {particle['size']:.2f} px\n")
                             f.write("\n")
-                
+
                 images_data.append({
                     'image': image,
                     'ground_truth': len(ground_truth),
                     'ground_truth_data': ground_truth,  # Store full ground truth data
                     'name': f'synthetic_{i+1:03d}'
                 })
-            
+
             if save_images:
-                self.statusBar().showMessage(f'Generated and saved {num_images} images to {image_output_dir}')
-                self.results_text.append(f"\n✓ Saved {num_images} images to: {image_output_dir}")
+                self.statusBar().showMessage(
+                    f'Generated and saved {num_images} images to {image_output_dir}')
+                self.results_text.append(
+                    f"\n✓ Saved {num_images} images to: {image_output_dir}")
             else:
-                self.statusBar().showMessage(f'Generated {num_images} synthetic images (in memory)')
-            
+                self.statusBar().showMessage(
+                    f'Generated {num_images} synthetic images (in memory)')
+
         else:
             # Load images from folder
-            folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select Image Folder")
             if not folder:
                 return
-            
+
             from pathlib import Path
             image_files = []
             for ext in ['*.png', '*.jpg', '*.jpeg', '*.tiff', '*.bmp']:
                 image_files.extend(Path(folder).glob(ext))
-            
+
             if not image_files:
-                QMessageBox.warning(self, "Warning", "No images found in folder")
+                QMessageBox.warning(
+                    self, "Warning", "No images found in folder")
                 return
-            
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, len(image_files))
-            
+
             for i, img_path in enumerate(image_files):
                 self.progress_bar.setValue(i)
                 QApplication.processEvents()
-                
+
                 image = cv2.imread(str(img_path))
                 if image is not None:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    
+
                     # Try to load ground truth with full particle details
                     ground_truth_count = 0
                     ground_truth_data = []
                     gt_path = self._find_ground_truth_file(img_path)
-                    
+
                     if gt_path and gt_path.exists():
                         try:
                             with open(gt_path, 'r') as f:
                                 content = f.read().strip()
-                                
+
                                 # Parse ground truth file
                                 # Support two formats:
                                 # Format 1 (simple): "Particles: N\nShapes:\n  1. Fragment\n  2. Fiber..."
                                 # Format 2 (detailed): "Total Particles: N\n\nParticle 1:\n  Shape: ...\n  Color: ..."
                                 lines = content.split('\n')
-                                
+
                                 # Get total count (try both formats)
                                 if lines and 'Particles:' in lines[0]:
-                                    ground_truth_count = int(lines[0].split(':')[1].strip())
-                                
+                                    ground_truth_count = int(
+                                        lines[0].split(':')[1].strip())
+
                                 # Check format type
-                                is_simple_format = any('Shapes:' in line for line in lines)
-                                
+                                is_simple_format = any(
+                                    'Shapes:' in line for line in lines)
+
                                 if is_simple_format:
                                     # Parse simple format: just numbered shapes
                                     in_shapes_section = False
@@ -2455,7 +2987,8 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                                         if in_shapes_section and line:
                                             # Line format: "  1. Fragment" or "1. Fragment"
                                             if '.' in line:
-                                                shape = line.split('.', 1)[1].strip()
+                                                shape = line.split('.', 1)[
+                                                    1].strip()
                                                 ground_truth_data.append({
                                                     'shape': shape
                                                 })
@@ -2466,93 +2999,105 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                                         line = line.strip()
                                         if not line:
                                             if current_particle:
-                                                ground_truth_data.append(current_particle)
+                                                ground_truth_data.append(
+                                                    current_particle)
                                                 current_particle = {}
                                             continue
-                                        
+
                                         if line.startswith('Particle '):
                                             if current_particle:
-                                                ground_truth_data.append(current_particle)
+                                                ground_truth_data.append(
+                                                    current_particle)
                                             current_particle = {}
                                         elif ':' in line:
                                             key, value = line.split(':', 1)
                                             key = key.strip()
                                             value = value.strip()
-                                            
+
                                             if key == 'Shape':
                                                 current_particle['shape'] = value
                                             elif key == 'Color':
                                                 current_particle['color_label'] = value
                                             elif key == 'Wavelength':
-                                                current_particle['wavelength'] = int(value.replace('nm', ''))
+                                                current_particle['wavelength'] = int(
+                                                    value.replace('nm', ''))
                                             elif key == 'Position':
                                                 # Parse (x, y) format
                                                 pos_str = value.strip('()')
                                                 x, y = pos_str.split(',')
-                                                current_particle['position'] = (float(x.strip()), float(y.strip()))
+                                                current_particle['position'] = (
+                                                    float(x.strip()), float(y.strip()))
                                             elif key == 'Area':
-                                                current_particle['area'] = float(value.split()[0])
+                                                current_particle['area'] = float(
+                                                    value.split()[0])
                                             elif key == 'Size':
-                                                current_particle['size'] = float(value.split()[0])
-                                    
+                                                current_particle['size'] = float(
+                                                    value.split()[0])
+
                                     # Add last particle
                                     if current_particle:
-                                        ground_truth_data.append(current_particle)
-                                    
+                                        ground_truth_data.append(
+                                            current_particle)
+
                         except Exception as e:
-                            print(f"Warning: Could not parse ground truth from {gt_path}: {e}")
+                            logger.warning(f"Warning: Could not parse ground truth from {gt_path}: {e}")
                             ground_truth_data = []
-                    
+
                     images_data.append({
                         'image': image,
                         'ground_truth': ground_truth_count,
                         'ground_truth_data': ground_truth_data,
                         'name': img_path.stem
                     })
-        
+
         if not images_data:
             QMessageBox.warning(self, "Warning", "No images to process")
             self.progress_bar.setVisible(False)
             return
-        
+
         # Count how many images have ground truth
-        images_with_gt = sum(1 for img in images_data if img['ground_truth'] > 0)
-        
+        images_with_gt = sum(
+            1 for img in images_data if img['ground_truth'] > 0)
+
         # Run benchmark on all images
         self.results_text.clear()
         self.results_text.append("=" * 60)
-        self.results_text.append(f"BATCH BENCHMARK - {len(images_data)} IMAGES")
+        self.results_text.append(
+            f"BATCH BENCHMARK - {len(images_data)} IMAGES")
         self.results_text.append("=" * 60)
         if images_with_gt > 0:
-            self.results_text.append(f"✓ Ground truth loaded for {images_with_gt}/{len(images_data)} images")
+            self.results_text.append(
+                f"✓ Ground truth loaded for {images_with_gt}/{len(images_data)} images")
         else:
             self.results_text.append(f"⚠ No ground truth files found")
-        
+
         quick_results_list = []
         deep_results_list = []
-        
+
         self.progress_bar.setRange(0, len(images_data) * 2)  # Quick + Deep
-        
+
         import time
         from collections import Counter
-        
+
         # Process all images with Quick Analysis
-        self.results_text.append(f"\n[1/2] Running Quick Analysis on {len(images_data)} images...")
+        self.results_text.append(
+            f"\n[1/2] Running Quick Analysis on {len(images_data)} images...")
         QApplication.processEvents()
-        
+
         quick_params = self.get_analysis_params('quick')
         quick_analyzer = QuickAnalyzer()
-        
+
         for i, img_data in enumerate(images_data):
             self.progress_bar.setValue(i)
-            self.statusBar().showMessage(f'Quick Analysis: {i+1}/{len(images_data)}')
+            self.statusBar().showMessage(
+                f'Quick Analysis: {i+1}/{len(images_data)}')
             QApplication.processEvents()
-            
+
             result = quick_analyzer.analyze(img_data['image'], quick_params)
-            
+
             # Debug: Log detection counts for first 5 images and any large discrepancies
             if i < 5 or (img_data['ground_truth'] > 0 and abs(result.num_detections - img_data['ground_truth']) > 5):
-                print(f"DEBUG Quick [{i+1}] {img_data['name']}: Detected={result.num_detections}, GT={img_data['ground_truth']}")
+                logger.debug(f"DEBUG Quick [{i+1}] {img_data['name']}: Detected={result.num_detections}, GT={img_data['ground_truth']}")
             
             quick_results_list.append({
                 'name': img_data['name'],
@@ -2561,19 +3106,21 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 'time': result.processing_time,
                 'result': result
             })
-        
+
         # Process all images with Deep Analysis
-        self.results_text.append(f"\n[2/2] Running Deep Analysis on {len(images_data)} images...")
+        self.results_text.append(
+            f"\n[2/2] Running Deep Analysis on {len(images_data)} images...")
         QApplication.processEvents()
-        
+
         deep_params = self.get_analysis_params('deep')
         deep_analyzer = DeepAnalyzer()
-        
+
         for i, img_data in enumerate(images_data):
             self.progress_bar.setValue(len(images_data) + i)
-            self.statusBar().showMessage(f'Deep Analysis: {i+1}/{len(images_data)}')
+            self.statusBar().showMessage(
+                f'Deep Analysis: {i+1}/{len(images_data)}')
             QApplication.processEvents()
-            
+
             result = deep_analyzer.analyze(img_data['image'], deep_params)
             deep_results_list.append({
                 'name': img_data['name'],
@@ -2582,55 +3129,70 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 'time': result.processing_time,
                 'result': result
             })
-        
+
         # Calculate aggregate statistics
         import numpy as np
-        
+
         quick_detections = [r['detected'] for r in quick_results_list]
         deep_detections = [r['detected'] for r in deep_results_list]
         quick_times = [r['time'] for r in quick_results_list]
         deep_times = [r['time'] for r in deep_results_list]
-        
-        ground_truths = [r['ground_truth'] for r in quick_results_list if r['ground_truth'] > 0]
-        
+
+        ground_truths = [r['ground_truth']
+                         for r in quick_results_list if r['ground_truth'] > 0]
+
         # Display summary
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("BATCH BENCHMARK SUMMARY")
         self.results_text.append("=" * 60)
-        
+
         self.results_text.append(f"\nProcessed: {len(images_data)} images")
-        
+
         # Display results in comparison table format
         if ground_truths:
             self.results_text.append("\n" + "-" * 60)
-            self.results_text.append(f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
+            self.results_text.append(
+                f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
             self.results_text.append("-" * 60)
-            self.results_text.append(f"{'Ground Truth':<20} {np.mean(ground_truths):<20.1f} {'N/A':<20}")
-            self.results_text.append(f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
-            self.results_text.append(f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
+            self.results_text.append(
+                f"{'Ground Truth':<20} {np.mean(ground_truths):<20.1f} {'N/A':<20}")
+            self.results_text.append(
+                f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
+            self.results_text.append(
+                f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
             self.results_text.append("-" * 60)
-            
-            self.results_text.append(f"\nGround Truth: {len(ground_truths)} images with GT (out of {len(images_data)} total)")
-            self.results_text.append(f"  Total particles: {np.sum(ground_truths):.0f}")
-            self.results_text.append(f"  Std deviation: ± {np.std(ground_truths):.1f}")
+
+            self.results_text.append(
+                f"\nGround Truth: {len(ground_truths)} images with GT (out of {len(images_data)} total)")
+            self.results_text.append(
+                f"  Total particles: {np.sum(ground_truths):.0f}")
+            self.results_text.append(
+                f"  Std deviation: ± {np.std(ground_truths):.1f}")
         else:
             self.results_text.append("\n" + "-" * 60)
-            self.results_text.append(f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
+            self.results_text.append(
+                f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
             self.results_text.append("-" * 60)
-            self.results_text.append(f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
-            self.results_text.append(f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
+            self.results_text.append(
+                f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
+            self.results_text.append(
+                f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
             self.results_text.append("-" * 60)
-        
+
         self.results_text.append(f"\nQuick Analysis Details:")
-        self.results_text.append(f"  Total detections: {np.sum(quick_detections):.0f}")
-        self.results_text.append(f"  Std deviation: ± {np.std(quick_detections):.1f}")
+        self.results_text.append(
+            f"  Total detections: {np.sum(quick_detections):.0f}")
+        self.results_text.append(
+            f"  Std deviation: ± {np.std(quick_detections):.1f}")
         self.results_text.append(f"  Total time: {np.sum(quick_times):.1f}s")
-        
+
         self.results_text.append(f"\nDeep Analysis Details:")
-        self.results_text.append(f"  Total detections: {np.sum(deep_detections):.0f}")
-        self.results_text.append(f"  Std deviation: ± {np.std(deep_detections):.1f}")
+        self.results_text.append(
+            f"  Total detections: {np.sum(deep_detections):.0f}")
+        self.results_text.append(
+            f"  Std deviation: ± {np.std(deep_detections):.1f}")
         self.results_text.append(f"  Total time: {np.sum(deep_times):.1f}s")
-        
+
         if ground_truths:
             # Calculate and display metrics
             def calc_metrics_batch(detections, gts):
@@ -2644,56 +3206,67 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     tp = min(det, gt)  # True positives
                     fp = max(0, det - gt)  # False positives (over-detection)
                     fn = max(0, gt - det)  # False negatives (missed particles)
-                    
+
                     total_tp += tp
                     total_fp += fp
                     total_fn += fn
-                
+
                 # Calculate overall metrics from totals
-                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-                
+                precision = total_tp / \
+                    (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+                recall = total_tp / \
+                    (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+                f1 = 2 * (precision * recall) / (precision +
+                                                 recall) if (precision + recall) > 0 else 0.0
+
                 return precision, recall, f1
-            
+
             quick_p, quick_r, quick_f = calc_metrics_batch(
-                [r['detected'] for r in quick_results_list if r['ground_truth'] > 0],
-                [r['ground_truth'] for r in quick_results_list if r['ground_truth'] > 0]
+                [r['detected']
+                    for r in quick_results_list if r['ground_truth'] > 0],
+                [r['ground_truth']
+                    for r in quick_results_list if r['ground_truth'] > 0]
             )
             deep_p, deep_r, deep_f = calc_metrics_batch(
-                [r['detected'] for r in deep_results_list if r['ground_truth'] > 0],
-                [r['ground_truth'] for r in deep_results_list if r['ground_truth'] > 0]
+                [r['detected']
+                    for r in deep_results_list if r['ground_truth'] > 0],
+                [r['ground_truth']
+                    for r in deep_results_list if r['ground_truth'] > 0]
             )
-            
+
             # Debug information
             quick_det_with_gt = [r['detected'] for r in quick_results_list if r['ground_truth'] > 0]
             quick_gt_with_gt = [r['ground_truth'] for r in quick_results_list if r['ground_truth'] > 0]
-            print(f"DEBUG Benchmark: {len(quick_gt_with_gt)} images with GT")
-            print(f"DEBUG Quick: Total detected={sum(quick_det_with_gt)}, Total GT={sum(quick_gt_with_gt)}")
-            print(f"DEBUG Quick: Precision={quick_p:.3f}, Recall={quick_r:.3f}, F1={quick_f:.3f}")
+            logger.debug(f"DEBUG Benchmark: {len(quick_gt_with_gt)} images with GT")
+            logger.debug(f"DEBUG Quick: Total detected={sum(quick_det_with_gt)}, Total GT={sum(quick_gt_with_gt)}")
+            logger.debug(f"DEBUG Quick: Precision={quick_p:.3f}, Recall={quick_r:.3f}, F1={quick_f:.3f}")
             
             self.results_text.append("\n" + "=" * 60)
             self.results_text.append("ACCURACY METRICS (vs Ground Truth)")
             self.results_text.append("=" * 60)
-            self.results_text.append(f"\n{'Method':<20} {'Precision':<15} {'Recall':<15} {'F1-Score':<15}")
+            self.results_text.append(
+                f"\n{'Method':<20} {'Precision':<15} {'Recall':<15} {'F1-Score':<15}")
             self.results_text.append("-" * 60)
-            self.results_text.append(f"{'Quick Analysis':<20} {quick_p:<15.3f} {quick_r:<15.3f} {quick_f:<15.3f}")
-            self.results_text.append(f"{'Deep Analysis':<20} {deep_p:<15.3f} {deep_r:<15.3f} {deep_f:<15.3f}")
+            self.results_text.append(
+                f"{'Quick Analysis':<20} {quick_p:<15.3f} {quick_r:<15.3f} {quick_f:<15.3f}")
+            self.results_text.append(
+                f"{'Deep Analysis':<20} {deep_p:<15.3f} {deep_r:<15.3f} {deep_f:<15.3f}")
             self.results_text.append("-" * 60)
         else:
             self.results_text.append(f"\n⚠ No ground truth data found")
-            self.results_text.append(f"  To calculate metrics, ensure ground truth files exist:")
+            self.results_text.append(
+                f"  To calculate metrics, ensure ground truth files exist:")
             self.results_text.append(f"  Format: <imagename>_groundtruth.txt")
             self.results_text.append(f"  Content: 'Particles: <count>'")
-        
+
         # Display aggregated distributions across all images
         self.results_text.append(f"\n" + "=" * 60)
         self.results_text.append("AGGREGATED DISTRIBUTIONS (ALL IMAGES)")
         self.results_text.append("=" * 60)
-        
+
         # Count total particles across all images
         from collections import Counter
-        
+
         # Quick Analysis aggregate distributions
         quick_all_shapes = Counter()
         quick_all_colors = Counter()
@@ -2704,15 +3277,17 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     quick_all_shapes[f.get('shape', 'Unknown')] += 1
                     quick_all_colors[f.get('color', 'Unknown')] += 1
                     quick_all_areas.append(f.get('area', 0))
-        
-        self.results_text.append(f"\nQuick Analysis - Total Particles: {sum(quick_detections)}")
+
+        self.results_text.append(
+            f"\nQuick Analysis - Total Particles: {sum(quick_detections)}")
         if quick_all_shapes:
             self.results_text.append(f"  Shapes: {dict(quick_all_shapes)}")
         if quick_all_colors:
             self.results_text.append(f"  Colors: {dict(quick_all_colors)}")
         if quick_all_areas:
-            self.results_text.append(f"  Area range: {min(quick_all_areas):.0f} - {max(quick_all_areas):.0f} pixels")
-        
+            self.results_text.append(
+                f"  Area range: {min(quick_all_areas):.0f} - {max(quick_all_areas):.0f} pixels")
+
         # Deep Analysis aggregate distributions
         deep_all_shapes = Counter()
         deep_all_colors = Counter()
@@ -2723,15 +3298,17 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     deep_all_shapes[f.get('shape', 'Unknown')] += 1
                     deep_all_colors[f.get('color', 'Unknown')] += 1
                     deep_all_areas.append(f.get('area', 0))
-        
-        self.results_text.append(f"\nDeep Analysis - Total Particles: {sum(deep_detections)}")
+
+        self.results_text.append(
+            f"\nDeep Analysis - Total Particles: {sum(deep_detections)}")
         if deep_all_shapes:
             self.results_text.append(f"  Shapes: {dict(deep_all_shapes)}")
         if deep_all_colors:
             self.results_text.append(f"  Colors: {dict(deep_all_colors)}")
         if deep_all_areas:
-            self.results_text.append(f"  Area range: {min(deep_all_areas):.0f} - {max(deep_all_areas):.0f} pixels")
-        
+            self.results_text.append(
+                f"  Area range: {min(deep_all_areas):.0f} - {max(deep_all_areas):.0f} pixels")
+
         # Ground Truth aggregate distributions (if available)
         gt_all_shapes = Counter()
         gt_all_colors = Counter()
@@ -2745,76 +3322,95 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     gt_all_colors[particle.get('color_label', 'Unknown')] += 1
                     if 'area' in particle:
                         gt_all_areas.append(particle['area'])
-        
+
         if has_gt_data:
-            self.results_text.append(f"\nGround Truth - Total Particles: {sum(ground_truths) if ground_truths else 0}")
+            self.results_text.append(
+                f"\nGround Truth - Total Particles: {sum(ground_truths) if ground_truths else 0}")
             if gt_all_shapes:
                 self.results_text.append(f"  Shapes: {dict(gt_all_shapes)}")
             if gt_all_colors:
                 self.results_text.append(f"  Colors: {dict(gt_all_colors)}")
             if gt_all_areas:
-                self.results_text.append(f"  Area range: {min(gt_all_areas):.0f} - {max(gt_all_areas):.0f} pixels")
-        
+                self.results_text.append(
+                    f"  Area range: {min(gt_all_areas):.0f} - {max(gt_all_areas):.0f} pixels")
+
         # Diagnostic: Compare distributions
         self.results_text.append(f"\n" + "=" * 60)
         self.results_text.append("SHAPE DISTRIBUTION COMPARISON")
         self.results_text.append("=" * 60)
-        all_shape_names = sorted(set(list(quick_all_shapes.keys()) + list(deep_all_shapes.keys()) + list(gt_all_shapes.keys())))
-        self.results_text.append(f"\n{'Shape':<20} {'Quick':<10} {'Deep':<10} {'GT':<10} {'Diff':<15}")
+        all_shape_names = sorted(set(list(quick_all_shapes.keys(
+        )) + list(deep_all_shapes.keys()) + list(gt_all_shapes.keys())))
+        self.results_text.append(
+            f"\n{'Shape':<20} {'Quick':<10} {'Deep':<10} {'GT':<10} {'Diff':<15}")
         self.results_text.append("-" * 60)
         for shape in all_shape_names:
             q = quick_all_shapes.get(shape, 0)
             d = deep_all_shapes.get(shape, 0)
             g = gt_all_shapes.get(shape, 0)
             diff = f"{(d-g)/g*100:+.1f}%" if g > 0 else "N/A"
-            self.results_text.append(f"{shape:<20} {q:<10} {d:<10} {g:<10} {diff:<15}")
-        
+            self.results_text.append(
+                f"{shape:<20} {q:<10} {d:<10} {g:<10} {diff:<15}")
+
         self.results_text.append(f"\n" + "=" * 60)
         self.results_text.append("COLOR DISTRIBUTION COMPARISON")
         self.results_text.append("=" * 60)
-        all_color_names = sorted(set(list(quick_all_colors.keys()) + list(deep_all_colors.keys()) + list(gt_all_colors.keys())))
-        self.results_text.append(f"\n{'Color':<20} {'Quick':<10} {'Deep':<10} {'GT':<10} {'Diff':<15}")
+        all_color_names = sorted(set(list(quick_all_colors.keys(
+        )) + list(deep_all_colors.keys()) + list(gt_all_colors.keys())))
+        self.results_text.append(
+            f"\n{'Color':<20} {'Quick':<10} {'Deep':<10} {'GT':<10} {'Diff':<15}")
         self.results_text.append("-" * 60)
         for color in all_color_names:
             q = quick_all_colors.get(color, 0)
             d = deep_all_colors.get(color, 0)
             g = gt_all_colors.get(color, 0)
             diff = f"{(d-g)/g*100:+.1f}%" if g > 0 else "N/A"
-            self.results_text.append(f"{color:<20} {q:<10} {d:<10} {g:<10} {diff:<15}")
-        
+            self.results_text.append(
+                f"{color:<20} {q:<10} {d:<10} {g:<10} {diff:<15}")
+
         self.results_text.append(f"\n⚠️  WHY GROUND TRUTH ≠ DETECTED:")
-        self.results_text.append(f"  1️⃣ Fragment OVER-detected ({deep_all_shapes.get('Fragment', 0)} vs GT {gt_all_shapes.get('Fragment', 0)}):")
-        self.results_text.append(f"     → Watershed splits overlapping particles into multiple fragments")
-        self.results_text.append(f"     → Edge detection creates extra small fragments")
-        self.results_text.append(f"  2️⃣ Film/Irregular UNDER-detected (missing from Quick/Deep):")
-        self.results_text.append(f"     → Don't meet shape classification thresholds (AR, C, E)")
-        self.results_text.append(f"     → May be classified as Fragment instead")
+        self.results_text.append(
+            f"  1️⃣ Fragment OVER-detected ({deep_all_shapes.get('Fragment', 0)} vs GT {gt_all_shapes.get('Fragment', 0)}):")
+        self.results_text.append(
+            f"     → Watershed splits overlapping particles into multiple fragments")
+        self.results_text.append(
+            f"     → Edge detection creates extra small fragments")
+        self.results_text.append(
+            f"  2️⃣ Film/Irregular UNDER-detected (missing from Quick/Deep):")
+        self.results_text.append(
+            f"     → Don't meet shape classification thresholds (AR, C, E)")
+        self.results_text.append(
+            f"     → May be classified as Fragment instead")
         self.results_text.append(f"  3️⃣ Fiber/Filament under-detected:")
-        self.results_text.append(f"     → Elongated shapes may break apart during preprocessing")
+        self.results_text.append(
+            f"     → Elongated shapes may break apart during preprocessing")
         self.results_text.append(f"  💡 SOLUTIONS:")
-        self.results_text.append(f"     • Adjust min_area threshold to capture smaller Film/Irregular")
-        self.results_text.append(f"     • Tune watershed distance_thresh to reduce Fragment splitting")
-        self.results_text.append(f"     • Review shape classification thresholds in constants.py")
-        
+        self.results_text.append(
+            f"     • Adjust min_area threshold to capture smaller Film/Irregular")
+        self.results_text.append(
+            f"     • Tune watershed distance_thresh to reduce Fragment splitting")
+        self.results_text.append(
+            f"     • Review shape classification thresholds in constants.py")
+
         # Create comparison charts
-        self._create_batch_comparison_charts(quick_results_list, deep_results_list, images_data)
-        
+        self._create_batch_comparison_charts(
+            quick_results_list, deep_results_list, images_data)
+
         # Generate HTML report
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("GENERATING HTML REPORT...")
         QApplication.processEvents()
-        
+
         try:
             from datetime import datetime
             from pathlib import Path
             from src.analysis.report_generator import ReportGenerator
-            
+
             # Calculate metrics for batch
             def calculate_batch_metrics(detections_list, ground_truths_list):
                 """Calculate aggregate precision, recall, F1 for batch"""
                 if not ground_truths_list or len(ground_truths_list) == 0:
                     return 0.0, 0.0, 0.0
-                
+
                 total_tp = total_fp = total_fn = 0
                 for detected, gt in zip(detections_list, ground_truths_list):
                     if gt > 0:
@@ -2824,33 +3420,44 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         total_tp += tp
                         total_fp += fp
                         total_fn += fn
-                
-                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-                
+
+                precision = total_tp / \
+                    (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+                recall = total_tp / \
+                    (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+                f1 = 2 * (precision * recall) / (precision +
+                                                 recall) if (precision + recall) > 0 else 0.0
+
                 return precision, recall, f1
-            
+
             # Get ground truth values for images that have them
-            gt_values = [r['ground_truth'] for r in quick_results_list if r['ground_truth'] > 0]
-            quick_det_with_gt = [r['detected'] for r in quick_results_list if r['ground_truth'] > 0]
-            deep_det_with_gt = [r['detected'] for r in deep_results_list if r['ground_truth'] > 0]
-            
-            quick_precision, quick_recall, quick_f1 = calculate_batch_metrics(quick_det_with_gt, gt_values)
-            deep_precision, deep_recall, deep_f1 = calculate_batch_metrics(deep_det_with_gt, gt_values)
-            
+            gt_values = [r['ground_truth']
+                         for r in quick_results_list if r['ground_truth'] > 0]
+            quick_det_with_gt = [r['detected']
+                                 for r in quick_results_list if r['ground_truth'] > 0]
+            deep_det_with_gt = [r['detected']
+                                for r in deep_results_list if r['ground_truth'] > 0]
+
+            quick_precision, quick_recall, quick_f1 = calculate_batch_metrics(
+                quick_det_with_gt, gt_values)
+            deep_precision, deep_recall, deep_f1 = calculate_batch_metrics(
+                deep_det_with_gt, gt_values)
+
             # Debug output
             self.results_text.append(f"\n[DEBUG] Metrics for HTML Report:")
-            self.results_text.append(f"  Quick: P={quick_precision:.3f}, R={quick_recall:.3f}, F1={quick_f1:.3f}")
-            self.results_text.append(f"  Deep: P={deep_precision:.3f}, R={deep_recall:.3f}, F1={deep_f1:.3f}")
-            self.results_text.append(f"  GT values count: {len(gt_values)}, Quick det count: {len(quick_det_with_gt)}")
-            
+            self.results_text.append(
+                f"  Quick: P={quick_precision:.3f}, R={quick_recall:.3f}, F1={quick_f1:.3f}")
+            self.results_text.append(
+                f"  Deep: P={deep_precision:.3f}, R={deep_recall:.3f}, F1={deep_f1:.3f}")
+            self.results_text.append(
+                f"  GT values count: {len(gt_values)}, Quick det count: {len(quick_det_with_gt)}")
+
             # Aggregate shape, color, and area distributions from all images
             from collections import Counter
-            
+
             # Filter to only fluorescent colors and grouped shapes
             fluorescent_colors = {'Red', 'Green', 'Blue', 'Yellow'}
-            
+
             # Quick Analysis distributions
             quick_shapes = Counter()
             quick_colors = Counter()
@@ -2864,7 +3471,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         if color in fluorescent_colors:
                             quick_colors[color] += 1
                         quick_areas.append(f.get('area', 0))
-            
+
             # Deep Analysis distributions
             deep_shapes = Counter()
             deep_colors = Counter()
@@ -2878,7 +3485,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         if color in fluorescent_colors:
                             deep_colors[color] += 1
                         deep_areas.append(f.get('area', 0))
-            
+
             # Ground Truth distributions (aggregate from all images)
             # Filter to only fluorescent colors and grouped shapes
             fluorescent_colors = {'Red', 'Green', 'Blue', 'Yellow'}
@@ -2889,7 +3496,8 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 if 'ground_truth_data' in img_data and img_data['ground_truth_data']:
                     for particle in img_data['ground_truth_data']:
                         # Map to grouped shape categories
-                        shape = map_to_grouped_shape(particle.get('shape', 'Unknown'))
+                        shape = map_to_grouped_shape(
+                            particle.get('shape', 'Unknown'))
                         gt_shapes[shape] += 1
                         # Filter to only fluorescent colors
                         color = particle.get('color_label', 'Unknown')
@@ -2897,7 +3505,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                             gt_colors[color] += 1
                         if 'area' in particle:
                             gt_areas.append(particle['area'])
-            
+
             # Aggregate data for report
             batch_data = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -2931,223 +3539,248 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     'area_distribution': gt_areas
                 } if gt_shapes or gt_colors or gt_areas else None
             }
-            
+
             report_gen = ReportGenerator()
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             output_dir = Path('benchmark_results')
             output_dir.mkdir(exist_ok=True)
-            
-            html_path = output_dir / f'batch_benchmark_{len(images_data)}images_{timestamp}.html'
+
+            html_path = output_dir / \
+                f'batch_benchmark_{len(images_data)}images_{timestamp}.html'
             report_gen.generate_benchmark_report(batch_data, str(html_path))
-            
+
             self.results_text.append(f"\n✓ HTML Report saved: {html_path}")
-            
+
             # Open in browser
             import webbrowser
             webbrowser.open(f'file:///{html_path.absolute()}')
-            
+
         except Exception as e:
             self.results_text.append(f"\n✗ Failed to generate report: {e}")
-        
+
         self.progress_bar.setVisible(False)
-        self.statusBar().showMessage(f'Batch benchmark complete - {len(images_data)} images processed')
+        self.statusBar().showMessage(
+            f'Batch benchmark complete - {len(images_data)} images processed')
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("BATCH BENCHMARK COMPLETE")
         self.results_text.append("=" * 60)
-    
+
     def _create_batch_comparison_charts(self, quick_results, deep_results, images_data):
         """Create comparison charts for batch benchmark with ground truth"""
         self.figure.clear()
-        
+
         import numpy as np
-        
+
         # Create 2x2 layout
         ax1 = self.figure.add_subplot(2, 2, 1)
         ax2 = self.figure.add_subplot(2, 2, 2)
         ax3 = self.figure.add_subplot(2, 2, 3)
         ax4 = self.figure.add_subplot(2, 2, 4)
-        
+
         # 1. Detection count distribution with ground truth
         quick_detections = [r['detected'] for r in quick_results]
         deep_detections = [r['detected'] for r in deep_results]
-        ground_truths = [img['ground_truth'] for img in images_data if img['ground_truth'] > 0]
-        
+        ground_truths = [img['ground_truth']
+                         for img in images_data if img['ground_truth'] > 0]
+
         max_val = max(max(quick_detections), max(deep_detections))
         if ground_truths:
             max_val = max(max_val, max(ground_truths))
-        
+
         bins = np.linspace(0, max_val, 30)
-        ax1.hist(quick_detections, bins=bins, alpha=0.5, label='Quick', color='#2196F3', edgecolor='black')
-        ax1.hist(deep_detections, bins=bins, alpha=0.5, label='Deep', color='#4CAF50', edgecolor='black')
+        ax1.hist(quick_detections, bins=bins, alpha=0.5,
+                 label='Quick', color='#2196F3', edgecolor='black')
+        ax1.hist(deep_detections, bins=bins, alpha=0.5,
+                 label='Deep', color='#4CAF50', edgecolor='black')
         if ground_truths:
-            ax1.hist(ground_truths, bins=bins, alpha=0.5, label='Ground Truth', color='#FF5722', edgecolor='black')
+            ax1.hist(ground_truths, bins=bins, alpha=0.5,
+                     label='Ground Truth', color='#FF5722', edgecolor='black')
         ax1.set_xlabel('Particle Count', fontsize=11, fontweight='bold')
         ax1.set_ylabel('Frequency', fontsize=11, fontweight='bold')
-        ax1.set_title('Detection Count Distribution', fontsize=12, fontweight='bold')
+        ax1.set_title('Detection Count Distribution',
+                      fontsize=12, fontweight='bold')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        
+
         # 2. Scatter plot: Quick vs Deep vs Ground Truth
         if ground_truths and len(ground_truths) == len(quick_detections):
             # If we have ground truth for all images, show GT comparison
             gt_full = [img['ground_truth'] for img in images_data]
-            ax2.scatter(gt_full, quick_detections, alpha=0.6, s=50, c='#2196F3', 
-                       edgecolors='black', label='Quick vs GT')
-            ax2.scatter(gt_full, deep_detections, alpha=0.6, s=50, c='#4CAF50', 
-                       edgecolors='black', label='Deep vs GT')
-            max_val = max(max(gt_full), max(quick_detections), max(deep_detections))
-            ax2.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='Perfect Match')
-            ax2.set_xlabel('Ground Truth Count', fontsize=11, fontweight='bold')
+            ax2.scatter(gt_full, quick_detections, alpha=0.6, s=50, c='#2196F3',
+                        edgecolors='black', label='Quick vs GT')
+            ax2.scatter(gt_full, deep_detections, alpha=0.6, s=50, c='#4CAF50',
+                        edgecolors='black', label='Deep vs GT')
+            max_val = max(max(gt_full), max(
+                quick_detections), max(deep_detections))
+            ax2.plot([0, max_val], [0, max_val], 'r--',
+                     linewidth=2, label='Perfect Match')
+            ax2.set_xlabel('Ground Truth Count',
+                           fontsize=11, fontweight='bold')
             ax2.set_ylabel('Detected Count', fontsize=11, fontweight='bold')
-            ax2.set_title('Detection vs Ground Truth', fontsize=12, fontweight='bold')
+            ax2.set_title('Detection vs Ground Truth',
+                          fontsize=12, fontweight='bold')
         else:
             # No complete GT, show Quick vs Deep
-            ax2.scatter(quick_detections, deep_detections, alpha=0.5, s=50, c='purple', edgecolors='black')
+            ax2.scatter(quick_detections, deep_detections,
+                        alpha=0.5, s=50, c='purple', edgecolors='black')
             max_val = max(max(quick_detections), max(deep_detections))
-            ax2.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='Perfect Agreement')
-            ax2.set_xlabel('Quick Analysis Count', fontsize=11, fontweight='bold')
-            ax2.set_ylabel('Deep Analysis Count', fontsize=11, fontweight='bold')
-            ax2.set_title('Quick vs Deep Detection Counts', fontsize=12, fontweight='bold')
+            ax2.plot([0, max_val], [0, max_val], 'r--',
+                     linewidth=2, label='Perfect Agreement')
+            ax2.set_xlabel('Quick Analysis Count',
+                           fontsize=11, fontweight='bold')
+            ax2.set_ylabel('Deep Analysis Count',
+                           fontsize=11, fontweight='bold')
+            ax2.set_title('Quick vs Deep Detection Counts',
+                          fontsize=12, fontweight='bold')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
-        
+
         # 3. Processing time comparison
         quick_times = [r['time'] for r in quick_results]
         deep_times = [r['time'] for r in deep_results]
-        
+
         methods = ['Quick', 'Deep']
         avg_times = [np.mean(quick_times), np.mean(deep_times)]
         std_times = [np.std(quick_times), np.std(deep_times)]
-        
-        bars = ax3.bar(methods, avg_times, yerr=std_times, capsize=10, 
-                      color=['#2196F3', '#4CAF50'], alpha=0.8, edgecolor='black', linewidth=2)
+
+        bars = ax3.bar(methods, avg_times, yerr=std_times, capsize=10,
+                       color=['#2196F3', '#4CAF50'], alpha=0.8, edgecolor='black', linewidth=2)
         ax3.set_ylabel('Time (seconds)', fontsize=11, fontweight='bold')
-        ax3.set_title('Average Processing Time', fontsize=12, fontweight='bold')
+        ax3.set_title('Average Processing Time',
+                      fontsize=12, fontweight='bold')
         ax3.grid(True, alpha=0.3, axis='y')
-        
+
         for bar, time_val in zip(bars, avg_times):
             height = bar.get_height()
             ax3.text(bar.get_x() + bar.get_width()/2., height + max(avg_times) * 0.02,
-                    f'{time_val:.3f}s', ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
+                     f'{time_val:.3f}s', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
         # 4. Statistics summary with ground truth
         stats_text = f"Batch Statistics ({len(quick_results)} images)\n\n"
-        
+
         if ground_truths:
             stats_text += f"Ground Truth:\n"
             stats_text += f"  Avg: {np.mean(ground_truths):.1f} ± {np.std(ground_truths):.1f}\n"
             stats_text += f"  Min: {np.min(ground_truths)}, Max: {np.max(ground_truths)}\n\n"
-        
+
         stats_text += f"Quick Analysis:\n"
         stats_text += f"  Avg: {np.mean(quick_detections):.1f} ± {np.std(quick_detections):.1f}\n"
         stats_text += f"  Min: {np.min(quick_detections)}, Max: {np.max(quick_detections)}\n"
         stats_text += f"  Time: {np.mean(quick_times):.3f}s avg\n\n"
-        
+
         stats_text += f"Deep Analysis:\n"
         stats_text += f"  Avg: {np.mean(deep_detections):.1f} ± {np.std(deep_detections):.1f}\n"
         stats_text += f"  Min: {np.min(deep_detections)}, Max: {np.max(deep_detections)}\n"
         stats_text += f"  Time: {np.mean(deep_times):.3f}s avg\n\n"
-        
+
         correlation = np.corrcoef(quick_detections, deep_detections)[0, 1]
         stats_text += f"Correlation: {correlation:.3f}\n"
-        
+
         difference = np.array(deep_detections) - np.array(quick_detections)
         stats_text += f"Avg Difference: {np.mean(difference):+.1f}"
-        
-        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, 
-                fontsize=10, verticalalignment='top', family='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes,
+                 fontsize=10, verticalalignment='top', family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         ax4.set_title('Statistical Summary', fontsize=12, fontweight='bold')
         ax4.axis('off')
         self.figure.clear()
-        
+
         import numpy as np
-        
+
         # Create 2x2 layout
         ax1 = self.figure.add_subplot(2, 2, 1)
         ax2 = self.figure.add_subplot(2, 2, 2)
         ax3 = self.figure.add_subplot(2, 2, 3)
         ax4 = self.figure.add_subplot(2, 2, 4)
-        
+
         # 1. Detection count distribution
         quick_detections = [r['detected'] for r in quick_results]
         deep_detections = [r['detected'] for r in deep_results]
-        
-        bins = np.linspace(0, max(max(quick_detections), max(deep_detections)), 30)
-        ax1.hist(quick_detections, bins=bins, alpha=0.6, label='Quick', color='#2196F3', edgecolor='black')
-        ax1.hist(deep_detections, bins=bins, alpha=0.6, label='Deep', color='#4CAF50', edgecolor='black')
+
+        bins = np.linspace(
+            0, max(max(quick_detections), max(deep_detections)), 30)
+        ax1.hist(quick_detections, bins=bins, alpha=0.6,
+                 label='Quick', color='#2196F3', edgecolor='black')
+        ax1.hist(deep_detections, bins=bins, alpha=0.6,
+                 label='Deep', color='#4CAF50', edgecolor='black')
         ax1.set_xlabel('Particle Count', fontsize=11, fontweight='bold')
         ax1.set_ylabel('Frequency', fontsize=11, fontweight='bold')
-        ax1.set_title('Detection Count Distribution', fontsize=12, fontweight='bold')
+        ax1.set_title('Detection Count Distribution',
+                      fontsize=12, fontweight='bold')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        
+
         # 2. Scatter plot: Quick vs Deep
-        ax2.scatter(quick_detections, deep_detections, alpha=0.5, s=50, c='purple', edgecolors='black')
+        ax2.scatter(quick_detections, deep_detections, alpha=0.5,
+                    s=50, c='purple', edgecolors='black')
         max_val = max(max(quick_detections), max(deep_detections))
-        ax2.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='Perfect Agreement')
+        ax2.plot([0, max_val], [0, max_val], 'r--',
+                 linewidth=2, label='Perfect Agreement')
         ax2.set_xlabel('Quick Analysis Count', fontsize=11, fontweight='bold')
         ax2.set_ylabel('Deep Analysis Count', fontsize=11, fontweight='bold')
-        ax2.set_title('Quick vs Deep Detection Counts', fontsize=12, fontweight='bold')
+        ax2.set_title('Quick vs Deep Detection Counts',
+                      fontsize=12, fontweight='bold')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
-        
+
         # 3. Processing time comparison
         quick_times = [r['time'] for r in quick_results]
         deep_times = [r['time'] for r in deep_results]
-        
+
         methods = ['Quick', 'Deep']
         avg_times = [np.mean(quick_times), np.mean(deep_times)]
         std_times = [np.std(quick_times), np.std(deep_times)]
-        
-        bars = ax3.bar(methods, avg_times, yerr=std_times, capsize=10, 
-                      color=['#2196F3', '#4CAF50'], alpha=0.8, edgecolor='black', linewidth=2)
+
+        bars = ax3.bar(methods, avg_times, yerr=std_times, capsize=10,
+                       color=['#2196F3', '#4CAF50'], alpha=0.8, edgecolor='black', linewidth=2)
         ax3.set_ylabel('Time (seconds)', fontsize=11, fontweight='bold')
-        ax3.set_title('Average Processing Time', fontsize=12, fontweight='bold')
+        ax3.set_title('Average Processing Time',
+                      fontsize=12, fontweight='bold')
         ax3.grid(True, alpha=0.3, axis='y')
-        
+
         for bar, time_val in zip(bars, avg_times):
             height = bar.get_height()
             ax3.text(bar.get_x() + bar.get_width()/2., height + max(avg_times) * 0.02,
-                    f'{time_val:.3f}s', ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
+                     f'{time_val:.3f}s', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
         # 4. Statistics summary
         stats_text = f"Batch Statistics ({len(quick_results)} images)\n\n"
         stats_text += f"Quick Analysis:\n"
         stats_text += f"  Avg: {np.mean(quick_detections):.1f} ± {np.std(quick_detections):.1f}\n"
         stats_text += f"  Min: {np.min(quick_detections)}, Max: {np.max(quick_detections)}\n"
         stats_text += f"  Time: {np.mean(quick_times):.3f}s avg\n\n"
-        
+
         stats_text += f"Deep Analysis:\n"
         stats_text += f"  Avg: {np.mean(deep_detections):.1f} ± {np.std(deep_detections):.1f}\n"
         stats_text += f"  Min: {np.min(deep_detections)}, Max: {np.max(deep_detections)}\n"
         stats_text += f"  Time: {np.mean(deep_times):.3f}s avg\n\n"
-        
+
         correlation = np.corrcoef(quick_detections, deep_detections)[0, 1]
         stats_text += f"Correlation: {correlation:.3f}\n"
-        
+
         difference = np.array(deep_detections) - np.array(quick_detections)
         stats_text += f"Avg Difference: {np.mean(difference):+.1f}"
-        
-        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, 
-                fontsize=10, verticalalignment='top', family='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes,
+                 fontsize=10, verticalalignment='top', family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         ax4.set_title('Statistical Summary', fontsize=12, fontweight='bold')
         ax4.axis('off')
-        
+
         self.figure.tight_layout()
         self.canvas.draw()
-        
+
         # Switch to Statistics tab
         self.tabs.setCurrentIndex(3)
-    
+
     def _calculate_metrics(self, result, method_name):
         """Calculate precision, recall, F1-score for analysis result"""
         from collections import Counter
-        
+
         detected = result.num_detections
         true_count = self.ground_truth_count if self.ground_truth_count > 0 else detected
-        
+
         # Calculate metrics (simple approximation)
         if true_count > 0:
             # True Positives: minimum of detected and ground truth (conservative)
@@ -3156,18 +3789,21 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             fp = max(0, detected - true_count)
             # False Negatives: missed particles
             fn = max(0, true_count - detected)
-            
+
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            f1_score = 2 * (precision * recall) / (precision +
+                                                   recall) if (precision + recall) > 0 else 0
         else:
             precision = recall = f1_score = 0
-        
+
         # Extract distributions
-        shape_dist = Counter([f['shape'] for f in result.features]) if result.features else {}
-        color_dist = Counter([f['color'] for f in result.features]) if result.features else {}
+        shape_dist = Counter(
+            [f['shape'] for f in result.features]) if result.features else {}
+        color_dist = Counter(
+            [f['color'] for f in result.features]) if result.features else {}
         areas = [f['area'] for f in result.features] if result.features else []
-        
+
         return {
             'method': method_name,
             'detected': detected,
@@ -3180,53 +3816,55 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             'color_distribution': dict(color_dist),
             'area_distribution': areas
         }
-        
+
     def on_analysis_complete(self, result):
         """Handle analysis completion"""
         self.progress_bar.setVisible(False)
-        
+
         if result is None:
             QMessageBox.warning(self, "Error", "Analysis failed")
             return
-            
+
         self.current_result = result
-        
+
         # Store result based on analysis type
         if result.analysis_type == 'quick':
             self.quick_result = result
         elif result.analysis_type == 'deep':
             self.deep_result = result
-        
+
         # Display mask
         if result.mask is not None:
             mask_rgb = cv2.cvtColor(result.mask, cv2.COLOR_GRAY2RGB)
             self.mask_label.set_image(mask_rgb)
-        
+
         # Create annotated image with ground truth comparison if available
         annotated = self.create_annotated_image(result)
         self.annotated_label.set_image(annotated)
-        
+        # >>> coppy image analysis
+        self.annotated_image = annotated.copy()
+
         # Update results summary with ground truth comparison
         self.update_results_summary(result)
-        
+
         # Update table
         self.update_results_table(result)
-        
+
         # Update charts with full visualization based on dropdown selection
         self.update_charts_full()
-        
+
         # Build status message with ground truth comparison
         status_msg = f'Analysis complete: {result.num_detections} particles in {result.processing_time:.2f}s'
         if self.ground_truth_count > 0:
             accuracy = (result.num_detections / self.ground_truth_count) * 100
             status_msg += f' | Ground Truth: {self.ground_truth_count} | Accuracy: {accuracy:.1f}%'
-        
+
         self.statusBar().showMessage(status_msg)
-        
+
     def create_annotated_image(self, result):
         """Create annotated image with detections"""
         annotated = self.current_image.copy()
-        
+
         # Color map for shapes (grouped categories)
         color_map = {
             'Microbead/Pellet': (255, 0, 0),
@@ -3235,28 +3873,28 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             'Fragment': (0, 255, 255),
             'Irregular': (128, 128, 128)
         }
-        
+
         for feature in result.features:
             # Get bounding box
             x, y, w, h = feature['bounding_box']
-            
+
             # Draw rectangle
             color = color_map.get(feature['shape'], (255, 255, 255))
             cv2.rectangle(annotated, (x, y), (x+w, y+h), color, 2)
-            
+
             # Add label
             label = f"{feature['shape']}"
-            cv2.putText(annotated, label, (x, y-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
+            cv2.putText(annotated, label, (x, y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
         return annotated
-        
+
     def update_results_summary(self, result):
         """Update results text summary"""
         text = f"Analysis Type: {result.analysis_type.upper()}\n"
         text += f"Processing Time: {result.processing_time:.3f} seconds\n"
         text += f"Detected Particles: {result.num_detections}\n"
-        
+
         # Ground truth comparison
         if self.ground_truth_count > 0:
             text += f"\n{'='*40}\n"
@@ -3264,197 +3902,222 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             text += f"{'='*40}\n"
             text += f"Ground Truth: {self.ground_truth_count} particles\n"
             text += f"Detected: {result.num_detections} particles\n"
-            
+
             # Calculate metrics
             detected = result.num_detections
             true_count = self.ground_truth_count
-            
+
             # Simple accuracy (assumes 1:1 matching)
-            accuracy = min(detected, true_count) / max(detected, true_count) * 100 if max(detected, true_count) > 0 else 0
-            
+            accuracy = min(detected, true_count) / max(detected,
+                                                       true_count) * 100 if max(detected, true_count) > 0 else 0
+
             # Precision and Recall estimates
             # Precision: of detected particles, how many are real
-            precision = min(detected, true_count) / detected if detected > 0 else 0
+            precision = min(detected, true_count) / \
+                detected if detected > 0 else 0
             # Recall: of real particles, how many were detected
-            recall = min(detected, true_count) / true_count if true_count > 0 else 0
+            recall = min(detected, true_count) / \
+                true_count if true_count > 0 else 0
             # F1 Score
-            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-            
+            f1_score = 2 * (precision * recall) / (precision +
+                                                   recall) if (precision + recall) > 0 else 0
+
             text += f"\nPrecision: {precision:.3f} ({precision*100:.1f}%)\n"
             text += f"Recall: {recall:.3f} ({recall*100:.1f}%)\n"
             text += f"F1-Score: {f1_score:.3f} ({f1_score*100:.1f}%)\n"
             text += f"Detection Rate: {accuracy:.1f}%\n"
-            
+
             if detected > true_count:
                 text += f"\n⚠ Over-detection: {detected - true_count} extra particles\n"
             elif detected < true_count:
                 text += f"\n⚠ Under-detection: {true_count - detected} particles missed\n"
             else:
                 text += f"\n✓ Perfect count match!\n"
-            
+
             text += f"{'='*40}\n\n"
-        
+
         text += f"Background: {result.background_color}\n"
-        
+
         if hasattr(result, 'fiber_count'):
             text += f"Fiber Count: {result.fiber_count}\n"
-        
+
         # Shape distribution
         from collections import Counter
         shapes = Counter([f['shape'] for f in result.features])
         text += "\nShape Distribution:\n"
         for shape, count in shapes.most_common():
             text += f"  {shape}: {count}\n"
-        
+
         self.results_text.setText(text)
-        
+
     def update_results_table(self, result):
         """Update results table with optional calibrated sizes"""
         features = result.features
-        
+
         if not features:
             return
-        
+
         # Get columns based on calibration status
         if self.calibration.is_calibrated:
-            columns = ['ID', 'Shape', 'Color', 'Area (μm²)', 'Diameter (μm)', 'Area (px)', 'Circularity']
+            columns = ['ID', 'Shape', 'Color',
+                       'Area (μm²)', 'Diameter (μm)', 'Area (px)', 'Circularity']
         else:
             columns = ['ID', 'Shape', 'Color', 'Area (px)', 'Circularity']
-        
+
         if 'aspect_ratio' in features[0]:
             columns.extend(['Eccentricity', 'Aspect Ratio'])
-        
+
         self.results_table.setColumnCount(len(columns))
         self.results_table.setHorizontalHeaderLabels(columns)
         self.results_table.setRowCount(len(features))
-        
+
         for i, feature in enumerate(features):
             col = 0
-            self.results_table.setItem(i, col, QTableWidgetItem(str(feature['id'])))
+            self.results_table.setItem(
+                i, col, QTableWidgetItem(str(feature['id'])))
             col += 1
-            self.results_table.setItem(i, col, QTableWidgetItem(feature['shape']))
+            self.results_table.setItem(
+                i, col, QTableWidgetItem(feature['shape']))
             col += 1
-            self.results_table.setItem(i, col, QTableWidgetItem(feature['color']))
+            self.results_table.setItem(
+                i, col, QTableWidgetItem(feature['color']))
             col += 1
-            
+
             # Add calibrated sizes if available
             if self.calibration.is_calibrated:
                 area_um2 = self.calibration.pixel_area_to_um2(feature['area'])
-                diameter_um = self.calibration.calculate_real_diameter(feature['area'])
-                
-                self.results_table.setItem(i, col, QTableWidgetItem(f"{area_um2:.1f}"))
+                diameter_um = self.calibration.calculate_real_diameter(
+                    feature['area'])
+
+                self.results_table.setItem(
+                    i, col, QTableWidgetItem(f"{area_um2:.1f}"))
                 col += 1
-                self.results_table.setItem(i, col, QTableWidgetItem(f"{diameter_um:.1f}"))
+                self.results_table.setItem(
+                    i, col, QTableWidgetItem(f"{diameter_um:.1f}"))
                 col += 1
-            
+
             # Pixel area
-            self.results_table.setItem(i, col, QTableWidgetItem(f"{feature['area']:.1f}"))
+            self.results_table.setItem(
+                i, col, QTableWidgetItem(f"{feature['area']:.1f}"))
             col += 1
-            
+
             # Circularity
-            self.results_table.setItem(i, col, QTableWidgetItem(f"{feature['circularity']:.3f}"))
+            self.results_table.setItem(
+                i, col, QTableWidgetItem(f"{feature['circularity']:.3f}"))
             col += 1
-            
+
             # Additional shape parameters if available
             if 'aspect_ratio' in feature:
-                self.results_table.setItem(i, col, QTableWidgetItem(f"{feature['eccentricity']:.3f}"))
+                self.results_table.setItem(i, col, QTableWidgetItem(
+                    f"{feature['eccentricity']:.3f}"))
                 col += 1
-                self.results_table.setItem(i, col, QTableWidgetItem(f"{feature['aspect_ratio']:.2f}"))
-        
+                self.results_table.setItem(i, col, QTableWidgetItem(
+                    f"{feature['aspect_ratio']:.2f}"))
+
         self.results_table.resizeColumnsToContents()
-        
+
     def update_charts(self, result):
         """Update statistics charts (basic version)"""
         self.figure.clear()
-        
+
         if not result.features:
             return
-        
+
         # Shape distribution pie chart
         from collections import Counter
         shapes = Counter([f['shape'] for f in result.features])
-        
+
         ax = self.figure.add_subplot(111)
         ax.pie(shapes.values(), labels=shapes.keys(), autopct='%1.1f%%')
         ax.set_title('Shape Distribution')
-        
+
         self.canvas.draw()
-        
+
     def update_charts_full(self):
         """Update statistics charts with comprehensive visualizations like original code"""
         if self.current_result is None or not self.current_result.features:
             return
-            
+
         features = self.current_result.features
         chart_type = self.chart_type_combo.currentText()
-        
+
         self.figure.clear()
-        
+
         from collections import Counter
         import numpy as np
-        
+
         if chart_type == 'All Charts':
             # Create 2x3 subplot layout (added 3D morphometric plot)
-            
+
             # 1. Shape Distribution (Pie Chart)
             ax1 = self.figure.add_subplot(2, 3, 1)
             shapes = Counter([f['shape'] for f in features])
-            
+
             # If ground truth data exists, create comparison bar chart instead of pie
             if self.ground_truth and len(self.ground_truth) > 0:
                 # Map ground truth shapes to grouped names
-                gt_shapes = Counter([map_to_grouped_shape(p['shape']) for p in self.ground_truth])
-                all_shapes = sorted(set(list(shapes.keys()) + list(gt_shapes.keys())))
-                
+                gt_shapes = Counter([map_to_grouped_shape(p['shape'])
+                                    for p in self.ground_truth])
+                all_shapes = sorted(
+                    set(list(shapes.keys()) + list(gt_shapes.keys())))
+
                 x = np.arange(len(all_shapes))
                 width = 0.35
-                
-                detected_counts = [shapes.get(shape, 0) for shape in all_shapes]
+
+                detected_counts = [shapes.get(shape, 0)
+                                   for shape in all_shapes]
                 gt_counts = [gt_shapes.get(shape, 0) for shape in all_shapes]
-                
-                ax1.bar(x - width/2, detected_counts, width, label=f'Detected (n={len(features)})', 
-                       color='#4CAF50', alpha=0.8)
-                ax1.bar(x + width/2, gt_counts, width, label=f'Ground Truth (n={len(self.ground_truth)})', 
-                       color='#FF5722', alpha=0.8)
-                
+
+                ax1.bar(x - width/2, detected_counts, width, label=f'Detected (n={len(features)})',
+                        color='#4CAF50', alpha=0.8)
+                ax1.bar(x + width/2, gt_counts, width, label=f'Ground Truth (n={len(self.ground_truth)})',
+                        color='#FF5722', alpha=0.8)
+
                 ax1.set_ylabel('Count', fontsize=10, fontweight='bold')
                 ax1.set_xticks(x)
-                ax1.set_xticklabels(all_shapes, rotation=45, ha='right', fontsize=8)
+                ax1.set_xticklabels(all_shapes, rotation=45,
+                                    ha='right', fontsize=8)
                 ax1.legend(fontsize=8)
                 ax1.grid(True, alpha=0.3, axis='y')
                 title_text = 'Shape Distribution Comparison'
             else:
-                ax1.pie(shapes.values(), labels=shapes.keys(), autopct='%1.1f%%', startangle=90)
+                ax1.pie(shapes.values(), labels=shapes.keys(),
+                        autopct='%1.1f%%', startangle=90)
                 title_text = f'Shape Distribution (n={len(features)})'
                 if self.ground_truth_count > 0:
                     title_text += f'\nGround Truth: {self.ground_truth_count}'
             ax1.set_title(title_text)
-            
+
             # 2. Size Distribution (Histogram) - Show calibrated sizes if available
             ax2 = self.figure.add_subplot(2, 3, 2)
-            
+
             if self.calibration.is_calibrated:
                 # Show diameter distribution in micrometers
-                diameters_um = [self.calibration.calculate_real_diameter(f['area']) for f in features]
-                
+                diameters_um = [self.calibration.calculate_real_diameter(
+                    f['area']) for f in features]
+
                 if self.ground_truth and len(self.ground_truth) > 0:
-                    gt_diameters_um = [self.calibration.calculate_real_diameter(p['area']) for p in self.ground_truth]
+                    gt_diameters_um = [self.calibration.calculate_real_diameter(
+                        p['area']) for p in self.ground_truth]
                     all_diameters = diameters_um + gt_diameters_um
-                    
+
                     if all_diameters:
-                        bins = np.linspace(min(all_diameters), max(all_diameters), 15)
-                        ax2.hist(diameters_um, bins=bins, alpha=0.6, label=f'Detected ({len(diameters_um)})', 
-                                color='#4CAF50', edgecolor='black')
-                        ax2.hist(gt_diameters_um, bins=bins, alpha=0.6, label=f'GT ({len(gt_diameters_um)})', 
-                                color='#FF5722', edgecolor='black')
+                        bins = np.linspace(
+                            min(all_diameters), max(all_diameters), 15)
+                        ax2.hist(diameters_um, bins=bins, alpha=0.6, label=f'Detected ({len(diameters_um)})',
+                                 color='#4CAF50', edgecolor='black')
+                        ax2.hist(gt_diameters_um, bins=bins, alpha=0.6, label=f'GT ({len(gt_diameters_um)})',
+                                 color='#FF5722', edgecolor='black')
                         ax2.legend(fontsize=7)
                         title_text = 'Diameter Distribution (μm)'
                 else:
-                    ax2.hist(diameters_um, bins=15, color='skyblue', edgecolor='black')
+                    ax2.hist(diameters_um, bins=15,
+                             color='skyblue', edgecolor='black')
                     title_text = 'Diameter Distribution'
                     mean_diam = np.mean(diameters_um)
-                    ax2.axvline(mean_diam, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-                
+                    ax2.axvline(mean_diam, color='red',
+                                linestyle='--', linewidth=1.5, alpha=0.7)
+
                 ax2.set_xlabel('Diameter (μm)', fontsize=9)
                 ax2.set_ylabel('Frequency', fontsize=9)
                 ax2.set_title(title_text, fontsize=10)
@@ -3462,39 +4125,40 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             else:
                 # Show pixel-based area distribution
                 areas = [f['area'] for f in features]
-                
+
                 if self.ground_truth and len(self.ground_truth) > 0:
                     gt_areas = [p['area'] for p in self.ground_truth]
                     all_areas = areas + gt_areas
-                    
+
                     if all_areas:
                         bins = np.linspace(min(all_areas), max(all_areas), 15)
-                        ax2.hist(areas, bins=bins, alpha=0.6, label=f'Detected ({len(areas)})', 
-                                color='#4CAF50', edgecolor='black')
-                        ax2.hist(gt_areas, bins=bins, alpha=0.6, label=f'GT ({len(gt_areas)})', 
-                                color='#FF5722', edgecolor='black')
+                        ax2.hist(areas, bins=bins, alpha=0.6, label=f'Detected ({len(areas)})',
+                                 color='#4CAF50', edgecolor='black')
+                        ax2.hist(gt_areas, bins=bins, alpha=0.6, label=f'GT ({len(gt_areas)})',
+                                 color='#FF5722', edgecolor='black')
                         ax2.legend(fontsize=7)
                         title_text = 'Area Distribution'
                 else:
-                    ax2.hist(areas, bins=15, color='skyblue', edgecolor='black')
+                    ax2.hist(areas, bins=15, color='skyblue',
+                             edgecolor='black')
                     title_text = 'Size Distribution'
                     if self.ground_truth_count > 0:
                         title_text += f' (GT: {self.ground_truth_count})'
-                
+
                 ax2.set_xlabel('Area (pixels)', fontsize=9)
                 ax2.set_ylabel('Frequency', fontsize=9)
                 ax2.set_title(title_text, fontsize=10)
                 ax2.grid(True, alpha=0.3)
-            
+
             # 3. Color Distribution (4 fluorescent colors with ground truth)
             ax3 = self.figure.add_subplot(2, 3, 3)
             from collections import Counter
-            
+
             # Get colors and map to 4 main colors
             colors_list = [f.get('color', 'Unknown') for f in features]
             main_colors = ['Red', 'Green', 'Blue', 'Yellow']
             color_counts = {c: 0 for c in main_colors}
-            
+
             for color_name in colors_list:
                 if 'Red' in color_name or 'Pink' in color_name or 'Orange' in color_name:
                     color_counts['Red'] += 1
@@ -3504,16 +4168,18 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     color_counts['Blue'] += 1
                 elif 'Yellow' in color_name:
                     color_counts['Yellow'] += 1
-            
+
             # Visual colors
-            visual_colors = {'Red': '#FF0000', 'Green': '#00FF00', 'Blue': '#0000FF', 'Yellow': '#FFFF00'}
-            
+            visual_colors = {'Red': '#FF0000', 'Green': '#00FF00',
+                             'Blue': '#0000FF', 'Yellow': '#FFFF00'}
+
             # Check if ground truth exists
             if self.ground_truth and len(self.ground_truth) > 0:
                 # Get ground truth colors
-                gt_colors_list = [p.get('color_label', 'Unknown') for p in self.ground_truth if 'color_label' in p]
+                gt_colors_list = [p.get('color_label', 'Unknown')
+                                  for p in self.ground_truth if 'color_label' in p]
                 gt_color_counts = {c: 0 for c in main_colors}
-                
+
                 for color_name in gt_colors_list:
                     if 'Red' in color_name or 'Pink' in color_name or 'Orange' in color_name:
                         gt_color_counts['Red'] += 1
@@ -3523,32 +4189,32 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         gt_color_counts['Blue'] += 1
                     elif 'Yellow' in color_name:
                         gt_color_counts['Yellow'] += 1
-                
+
                 # Create grouped bar chart
                 x = np.arange(len(main_colors))
                 width = 0.35
-                
+
                 bars1 = ax3.bar(x - width/2, [color_counts[c] for c in main_colors], width,
-                               label=f'Detected (n={len(features)})',
-                               color=[visual_colors[c] for c in main_colors],
-                               alpha=0.7, edgecolor='black', linewidth=1.5)
+                                label=f'Detected (n={len(features)})',
+                                color=[visual_colors[c] for c in main_colors],
+                                alpha=0.7, edgecolor='black', linewidth=1.5)
                 bars2 = ax3.bar(x + width/2, [gt_color_counts[c] for c in main_colors], width,
-                               label=f'Ground Truth (n={len(self.ground_truth)})',
-                               color=[visual_colors[c] for c in main_colors],
-                               alpha=0.4, edgecolor='black', linewidth=1.5, hatch='//')
-                
+                                label=f'Ground Truth (n={len(self.ground_truth)})',
+                                color=[visual_colors[c] for c in main_colors],
+                                alpha=0.4, edgecolor='black', linewidth=1.5, hatch='//')
+
                 # Add count labels
                 for bar in bars1:
                     height = bar.get_height()
                     if height > 0:
                         ax3.text(bar.get_x() + bar.get_width()/2., height,
-                                f'{int(height)}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+                                 f'{int(height)}', ha='center', va='bottom', fontsize=9, fontweight='bold')
                 for bar in bars2:
                     height = bar.get_height()
                     if height > 0:
                         ax3.text(bar.get_x() + bar.get_width()/2., height,
-                                f'{int(height)}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-                
+                                 f'{int(height)}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
                 ax3.set_xticks(x)
                 ax3.set_xticklabels(main_colors)
                 ax3.legend(fontsize=8)
@@ -3556,33 +4222,33 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             else:
                 # No ground truth - single bar chart
                 bars = ax3.bar(main_colors, [color_counts[c] for c in main_colors],
-                              color=[visual_colors[c] for c in main_colors],
-                              alpha=0.8, edgecolor='black', linewidth=2)
-                
+                               color=[visual_colors[c] for c in main_colors],
+                               alpha=0.8, edgecolor='black', linewidth=2)
+
                 # Add count labels on bars
                 for bar in bars:
                     height = bar.get_height()
                     if height > 0:
                         ax3.text(bar.get_x() + bar.get_width()/2., height,
-                                f'{int(height)}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-                
+                                 f'{int(height)}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
                 title_text = f'Color Distribution (n={len(features)})'
-            
+
             ax3.set_ylabel('Count', fontsize=10, fontweight='bold')
             ax3.set_title(title_text, fontsize=10)
             ax3.grid(True, alpha=0.3, axis='y')
-            
+
             # 4. 3D Morphometric Parameters (Circularity, Aspect Ratio, Eccentricity)
             ax4 = self.figure.add_subplot(2, 2, 4, projection='3d')
             colors_map = {'Microbead/Pellet': 'red', 'Fiber/Filament': 'blue',
-                         'Fragment': 'cyan',
-                         'Irregular': 'gray'}
-            
+                          'Fragment': 'cyan',
+                          'Irregular': 'gray'}
+
             # Extract morphometric parameters
             circularities = [f.get('circularity', 0) for f in features]
             aspect_ratios = [f.get('aspect_ratio', 1) for f in features]
             eccentricities = [f.get('eccentricity', 0) for f in features]
-            
+
             # Color by shape type
             for shape in set([f['shape'] for f in features]):
                 shape_features = [f for f in features if f['shape'] == shape]
@@ -3590,8 +4256,8 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 y = [f.get('aspect_ratio', 1) for f in shape_features]
                 z = [f.get('eccentricity', 0) for f in shape_features]
                 ax4.scatter(x, y, z, label=shape, alpha=0.6,
-                           c=colors_map.get(shape, 'black'), s=30)
-            
+                            c=colors_map.get(shape, 'black'), s=30)
+
             ax4.set_xlabel('Circularity', fontsize=9)
             ax4.set_ylabel('Aspect Ratio', fontsize=9)
             ax4.set_zlabel('Eccentricity', fontsize=9)
@@ -3601,206 +4267,221 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             ax4.set_title(title_text, fontsize=10)
             ax4.legend(loc='upper left', fontsize=7)
             ax4.view_init(elev=20, azim=45)
-            
+
         elif chart_type == 'Shape Distribution':
             ax = self.figure.add_subplot(111)
             shapes = Counter([f['shape'] for f in features])
-            
+
             # If ground truth exists, show comparison bar chart
             if self.ground_truth and len(self.ground_truth) > 0:
                 # Map ground truth shapes to grouped names
-                gt_shapes = Counter([map_to_grouped_shape(p['shape']) for p in self.ground_truth])
-                all_shapes = sorted(set(list(shapes.keys()) + list(gt_shapes.keys())))
-                
+                gt_shapes = Counter([map_to_grouped_shape(p['shape'])
+                                    for p in self.ground_truth])
+                all_shapes = sorted(
+                    set(list(shapes.keys()) + list(gt_shapes.keys())))
+
                 x = np.arange(len(all_shapes))
                 width = 0.35
-                
-                detected_counts = [shapes.get(shape, 0) for shape in all_shapes]
+
+                detected_counts = [shapes.get(shape, 0)
+                                   for shape in all_shapes]
                 gt_counts = [gt_shapes.get(shape, 0) for shape in all_shapes]
-                
-                bars1 = ax.bar(x - width/2, detected_counts, width, 
-                              label=f'Detected ({len(features)} particles)', 
-                              color='#4CAF50', alpha=0.8, edgecolor='black', linewidth=1.5)
-                bars2 = ax.bar(x + width/2, gt_counts, width, 
-                              label=f'Ground Truth ({len(self.ground_truth)} particles)', 
-                              color='#FF5722', alpha=0.8, edgecolor='black', linewidth=1.5)
-                
+
+                bars1 = ax.bar(x - width/2, detected_counts, width,
+                               label=f'Detected ({len(features)} particles)',
+                               color='#4CAF50', alpha=0.8, edgecolor='black', linewidth=1.5)
+                bars2 = ax.bar(x + width/2, gt_counts, width,
+                               label=f'Ground Truth ({len(self.ground_truth)} particles)',
+                               color='#FF5722', alpha=0.8, edgecolor='black', linewidth=1.5)
+
                 ax.set_ylabel('Count', fontsize=12, fontweight='bold')
                 ax.set_xlabel('Shape Type', fontsize=12, fontweight='bold')
                 ax.set_xticks(x)
-                ax.set_xticklabels(all_shapes, rotation=45, ha='right', fontsize=11)
+                ax.set_xticklabels(all_shapes, rotation=45,
+                                   ha='right', fontsize=11)
                 ax.legend(fontsize=11)
                 ax.grid(True, alpha=0.3, axis='y')
-                
+
                 # Add value labels on bars
                 for bars in [bars1, bars2]:
                     for bar in bars:
                         height = bar.get_height()
                         if height > 0:
                             ax.text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                                   f'{int(height)}', ha='center', va='bottom', fontsize=9)
-                
+                                    f'{int(height)}', ha='center', va='bottom', fontsize=9)
+
                 title_text = 'Shape Distribution Comparison'
             else:
-                ax.pie(shapes.values(), labels=shapes.keys(), autopct='%1.1f%%', startangle=90)
+                ax.pie(shapes.values(), labels=shapes.keys(),
+                       autopct='%1.1f%%', startangle=90)
                 title_text = f'Shape Distribution\n(Detected: {len(features)} particles)'
                 if self.ground_truth_count > 0:
                     title_text += f'\nGround Truth: {self.ground_truth_count}'
             ax.set_title(title_text)
-            
+
         elif chart_type == 'Size Distribution':
             # Show size distribution with calibrated sizes when available
             if self.calibration.is_calibrated:
                 # Create subplots for both area and diameter distributions
                 ax1 = self.figure.add_subplot(2, 1, 1)
                 ax2 = self.figure.add_subplot(2, 1, 2)
-                
+
                 # Convert to real-world sizes
-                areas_um2 = [self.calibration.pixel_area_to_um2(f['area']) for f in features]
-                diameters_um = [self.calibration.calculate_real_diameter(f['area']) for f in features]
-                
+                areas_um2 = [self.calibration.pixel_area_to_um2(
+                    f['area']) for f in features]
+                diameters_um = [self.calibration.calculate_real_diameter(
+                    f['area']) for f in features]
+
                 # Plot 1: Area distribution in μm²
                 if self.ground_truth and len(self.ground_truth) > 0:
-                    gt_areas_um2 = [self.calibration.pixel_area_to_um2(p['area']) for p in self.ground_truth]
+                    gt_areas_um2 = [self.calibration.pixel_area_to_um2(
+                        p['area']) for p in self.ground_truth]
                     all_areas = areas_um2 + gt_areas_um2
-                    
+
                     if all_areas:
                         bins = np.linspace(min(all_areas), max(all_areas), 25)
-                        ax1.hist(areas_um2, bins=bins, alpha=0.6, label=f'Detected (n={len(areas_um2)})', 
-                               color='#4CAF50', edgecolor='black', linewidth=1.2)
-                        ax1.hist(gt_areas_um2, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_areas_um2)})', 
-                               color='#FF5722', edgecolor='black', linewidth=1.2)
-                        
+                        ax1.hist(areas_um2, bins=bins, alpha=0.6, label=f'Detected (n={len(areas_um2)})',
+                                 color='#4CAF50', edgecolor='black', linewidth=1.2)
+                        ax1.hist(gt_areas_um2, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_areas_um2)})',
+                                 color='#FF5722', edgecolor='black', linewidth=1.2)
+
                         mean_detected = np.mean(areas_um2)
                         mean_gt = np.mean(gt_areas_um2)
-                        ax1.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2, 
-                                  label=f'Mean: {mean_detected:.1f} μm²')
-                        ax1.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2, 
-                                  label=f'GT Mean: {mean_gt:.1f} μm²')
+                        ax1.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2,
+                                    label=f'Mean: {mean_detected:.1f} μm²')
+                        ax1.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2,
+                                    label=f'GT Mean: {mean_gt:.1f} μm²')
                         title1 = 'Particle Area Distribution (μm²)'
                 else:
-                    ax1.hist(areas_um2, bins=30, color='skyblue', edgecolor='black', alpha=0.7)
+                    ax1.hist(areas_um2, bins=30, color='skyblue',
+                             edgecolor='black', alpha=0.7)
                     mean_area = np.mean(areas_um2)
                     median_area = np.median(areas_um2)
-                    ax1.axvline(mean_area, color='red', linestyle='--', linewidth=2, 
-                              label=f'Mean: {mean_area:.1f} μm²')
-                    ax1.axvline(median_area, color='green', linestyle='--', linewidth=2, 
-                              label=f'Median: {median_area:.1f} μm²')
+                    ax1.axvline(mean_area, color='red', linestyle='--', linewidth=2,
+                                label=f'Mean: {mean_area:.1f} μm²')
+                    ax1.axvline(median_area, color='green', linestyle='--', linewidth=2,
+                                label=f'Median: {median_area:.1f} μm²')
                     title1 = f'Particle Area Distribution (n={len(features)})'
-                
+
                 ax1.set_xlabel('Area (μm²)', fontsize=11, fontweight='bold')
                 ax1.set_ylabel('Frequency', fontsize=11, fontweight='bold')
                 ax1.set_title(title1, fontsize=12, fontweight='bold')
                 ax1.grid(True, alpha=0.3)
                 ax1.legend(fontsize=9)
-                
+
                 # Plot 2: Diameter distribution in μm with size categories
                 if self.ground_truth and len(self.ground_truth) > 0:
-                    gt_diameters_um = [self.calibration.calculate_real_diameter(p['area']) for p in self.ground_truth]
+                    gt_diameters_um = [self.calibration.calculate_real_diameter(
+                        p['area']) for p in self.ground_truth]
                     all_diameters = diameters_um + gt_diameters_um
-                    
+
                     if all_diameters:
-                        bins = np.linspace(min(all_diameters), max(all_diameters), 25)
-                        ax2.hist(diameters_um, bins=bins, alpha=0.6, label=f'Detected (n={len(diameters_um)})', 
-                               color='#4CAF50', edgecolor='black', linewidth=1.2)
-                        ax2.hist(gt_diameters_um, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_diameters_um)})', 
-                               color='#FF5722', edgecolor='black', linewidth=1.2)
-                        
+                        bins = np.linspace(
+                            min(all_diameters), max(all_diameters), 25)
+                        ax2.hist(diameters_um, bins=bins, alpha=0.6, label=f'Detected (n={len(diameters_um)})',
+                                 color='#4CAF50', edgecolor='black', linewidth=1.2)
+                        ax2.hist(gt_diameters_um, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_diameters_um)})',
+                                 color='#FF5722', edgecolor='black', linewidth=1.2)
+
                         mean_detected = np.mean(diameters_um)
                         mean_gt = np.mean(gt_diameters_um)
-                        ax2.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2, 
-                                  label=f'Mean: {mean_detected:.1f} μm')
-                        ax2.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2, 
-                                  label=f'GT Mean: {mean_gt:.1f} μm')
+                        ax2.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2,
+                                    label=f'Mean: {mean_detected:.1f} μm')
+                        ax2.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2,
+                                    label=f'GT Mean: {mean_gt:.1f} μm')
                 else:
-                    ax2.hist(diameters_um, bins=30, color='lightcoral', edgecolor='black', alpha=0.7)
+                    ax2.hist(diameters_um, bins=30, color='lightcoral',
+                             edgecolor='black', alpha=0.7)
                     mean_diam = np.mean(diameters_um)
                     median_diam = np.median(diameters_um)
-                    ax2.axvline(mean_diam, color='red', linestyle='--', linewidth=2, 
-                              label=f'Mean: {mean_diam:.1f} μm')
-                    ax2.axvline(median_diam, color='green', linestyle='--', linewidth=2, 
-                              label=f'Median: {median_diam:.1f} μm')
-                
+                    ax2.axvline(mean_diam, color='red', linestyle='--', linewidth=2,
+                                label=f'Mean: {mean_diam:.1f} μm')
+                    ax2.axvline(median_diam, color='green', linestyle='--', linewidth=2,
+                                label=f'Median: {median_diam:.1f} μm')
+
                 # Add size category markers
-                ax2.axvline(10, color='purple', linestyle=':', linewidth=1.5, alpha=0.7, 
-                          label='10 μm (Nano/Micro)')
-                ax2.axvline(100, color='orange', linestyle=':', linewidth=1.5, alpha=0.7, 
-                          label='100 μm (Micro/Meso)')
-                
+                ax2.axvline(10, color='purple', linestyle=':', linewidth=1.5, alpha=0.7,
+                            label='10 μm (Nano/Micro)')
+                ax2.axvline(100, color='orange', linestyle=':', linewidth=1.5, alpha=0.7,
+                            label='100 μm (Micro/Meso)')
+
                 ax2.set_xlabel('Diameter (μm)', fontsize=11, fontweight='bold')
                 ax2.set_ylabel('Frequency', fontsize=11, fontweight='bold')
-                ax2.set_title('Particle Diameter Distribution', fontsize=12, fontweight='bold')
+                ax2.set_title('Particle Diameter Distribution',
+                              fontsize=12, fontweight='bold')
                 ax2.grid(True, alpha=0.3)
                 ax2.legend(fontsize=9)
-                
+
                 # Add info text
                 info_text = f'Calibration: {self.calibration.um_per_pixel_x:.3f} μm/pixel'
-                self.figure.text(0.99, 0.01, info_text, ha='right', va='bottom', 
-                               fontsize=9, style='italic', color='gray')
-                
+                self.figure.text(0.99, 0.01, info_text, ha='right', va='bottom',
+                                 fontsize=9, style='italic', color='gray')
+
             else:
                 # Not calibrated - show pixel-based distribution
                 ax = self.figure.add_subplot(111)
                 areas = [f['area'] for f in features]
-                
+
                 # Add ground truth if available
                 if self.ground_truth and len(self.ground_truth) > 0:
                     gt_areas = [p['area'] for p in self.ground_truth]
                     all_areas = areas + gt_areas
-                    
+
                     if all_areas:
                         bins = np.linspace(min(all_areas), max(all_areas), 25)
-                        ax.hist(areas, bins=bins, alpha=0.6, label=f'Detected (n={len(areas)})', 
-                               color='#4CAF50', edgecolor='black', linewidth=1.2)
-                        ax.hist(gt_areas, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_areas)})', 
-                               color='#FF5722', edgecolor='black', linewidth=1.2)
-                        
+                        ax.hist(areas, bins=bins, alpha=0.6, label=f'Detected (n={len(areas)})',
+                                color='#4CAF50', edgecolor='black', linewidth=1.2)
+                        ax.hist(gt_areas, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_areas)})',
+                                color='#FF5722', edgecolor='black', linewidth=1.2)
+
                         # Add mean lines
                         mean_detected = np.mean(areas)
                         mean_gt = np.mean(gt_areas)
-                        ax.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2, 
-                                  label=f'Detected Mean: {mean_detected:.1f} px²')
-                        ax.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2, 
-                                  label=f'GT Mean: {mean_gt:.1f} px²')
-                        
+                        ax.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2,
+                                   label=f'Detected Mean: {mean_detected:.1f} px²')
+                        ax.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2,
+                                   label=f'GT Mean: {mean_gt:.1f} px²')
+
                         title_text = 'Particle Area Distribution Comparison'
                 else:
-                    ax.hist(areas, bins=30, color='skyblue', edgecolor='black', alpha=0.7)
+                    ax.hist(areas, bins=30, color='skyblue',
+                            edgecolor='black', alpha=0.7)
                     mean_area = np.mean(areas)
                     median_area = np.median(areas)
-                    ax.axvline(mean_area, color='red', linestyle='--', linewidth=2, 
-                              label=f'Mean: {mean_area:.1f} px²')
-                    ax.axvline(median_area, color='green', linestyle='--', linewidth=2, 
-                              label=f'Median: {median_area:.1f} px²')
+                    ax.axvline(mean_area, color='red', linestyle='--', linewidth=2,
+                               label=f'Mean: {mean_area:.1f} px²')
+                    ax.axvline(median_area, color='green', linestyle='--', linewidth=2,
+                               label=f'Median: {median_area:.1f} px²')
                     title_text = f'Particle Size Distribution (n={len(features)})'
                     if self.ground_truth_count > 0:
                         title_text += f'\nGround Truth: {self.ground_truth_count}'
-                
+
                 ax.set_xlabel('Area (pixels²)', fontsize=12, fontweight='bold')
                 ax.set_ylabel('Frequency', fontsize=12, fontweight='bold')
                 ax.set_title(title_text, fontsize=14, fontweight='bold')
                 ax.grid(True, alpha=0.3)
                 ax.legend(fontsize=10)
-                
+
                 # Add calibration reminder
-                self.figure.text(0.99, 0.01, '⚠ Not calibrated - Click "Camera Calibration" for real-world sizes', 
-                               ha='right', va='bottom', fontsize=9, style='italic', color='orange')
-        
+                self.figure.text(0.99, 0.01, '⚠ Not calibrated - Click "Camera Calibration" for real-world sizes',
+                                 ha='right', va='bottom', fontsize=9, style='italic', color='orange')
+
         elif chart_type == 'Size Categories':
             # Show size category distribution (requires calibration)
             if self.calibration.is_calibrated:
                 ax = self.figure.add_subplot(111)
-                
+
                 # Calculate size categories for all particles
                 from collections import Counter
                 size_categories = []
                 for f in features:
-                    diameter_um = self.calibration.calculate_real_diameter(f['area'])
+                    diameter_um = self.calibration.calculate_real_diameter(
+                        f['area'])
                     category = self.calibration.get_size_category(diameter_um)
                     size_categories.append(category)
-                
+
                 category_counts = Counter(size_categories)
-                
+
                 # Define category order and colors
                 all_categories = [
                     'Nanoplastic (<10 μm)',
@@ -3809,7 +4490,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     'Large Microplastic (1-5 mm)',
                     'Macroplastic (>5 mm)'
                 ]
-                
+
                 category_colors = {
                     'Nanoplastic (<10 μm)': '#E91E63',
                     'Small Microplastic (10-100 μm)': '#2196F3',
@@ -3817,118 +4498,128 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     'Large Microplastic (1-5 mm)': '#FF9800',
                     'Macroplastic (>5 mm)': '#9C27B0'
                 }
-                
+
                 # Filter to only categories present in data
-                present_categories = [cat for cat in all_categories if category_counts.get(cat, 0) > 0]
-                counts = [category_counts.get(cat, 0) for cat in present_categories]
-                colors = [category_colors.get(cat, 'gray') for cat in present_categories]
-                
+                present_categories = [
+                    cat for cat in all_categories if category_counts.get(cat, 0) > 0]
+                counts = [category_counts.get(cat, 0)
+                          for cat in present_categories]
+                colors = [category_colors.get(cat, 'gray')
+                          for cat in present_categories]
+
                 # Create bar chart
-                bars = ax.bar(range(len(present_categories)), counts, color=colors, 
-                             edgecolor='black', linewidth=2, alpha=0.8)
-                
+                bars = ax.bar(range(len(present_categories)), counts, color=colors,
+                              edgecolor='black', linewidth=2, alpha=0.8)
+
                 # Add value labels on bars
                 for i, (bar, count) in enumerate(zip(bars, counts)):
                     height = bar.get_height()
                     percentage = (count / len(features)) * 100
                     ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{count}\n({percentage:.1f}%)',
-                           ha='center', va='bottom', fontsize=10, fontweight='bold')
-                
+                            f'{count}\n({percentage:.1f}%)',
+                            ha='center', va='bottom', fontsize=10, fontweight='bold')
+
                 ax.set_xticks(range(len(present_categories)))
-                ax.set_xticklabels(present_categories, rotation=45, ha='right', fontsize=10)
-                ax.set_ylabel('Number of Particles', fontsize=12, fontweight='bold')
-                ax.set_title(f'Size Category Distribution (n={len(features)})', 
-                           fontsize=14, fontweight='bold')
+                ax.set_xticklabels(present_categories,
+                                   rotation=45, ha='right', fontsize=10)
+                ax.set_ylabel('Number of Particles',
+                              fontsize=12, fontweight='bold')
+                ax.set_title(f'Size Category Distribution (n={len(features)})',
+                             fontsize=14, fontweight='bold')
                 ax.grid(True, alpha=0.3, axis='y')
-                
+
                 # Add statistics
-                diameters_um = [self.calibration.calculate_real_diameter(f['area']) for f in features]
+                diameters_um = [self.calibration.calculate_real_diameter(
+                    f['area']) for f in features]
                 mean_diam = np.mean(diameters_um)
                 median_diam = np.median(diameters_um)
                 min_diam = np.min(diameters_um)
                 max_diam = np.max(diameters_um)
-                
+
                 stats_text = (f'Size Range: {min_diam:.1f} - {max_diam:.1f} μm\n'
-                            f'Mean: {mean_diam:.1f} μm | Median: {median_diam:.1f} μm\n'
-                            f'Calibration: {self.calibration.um_per_pixel_x:.3f} μm/pixel')
-                
+                              f'Mean: {mean_diam:.1f} μm | Median: {median_diam:.1f} μm\n'
+                              f'Calibration: {self.calibration.um_per_pixel_x:.3f} μm/pixel')
+
                 self.figure.text(0.02, 0.98, stats_text, ha='left', va='top',
-                               fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                
+                                 fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
             else:
                 # Show message about calibration needed
                 ax = self.figure.add_subplot(111)
-                ax.text(0.5, 0.5, 
-                       '📐 Camera Calibration Required\n\n'
-                       'To view size categories, please:\n'
-                       '1. Click "Camera Calibration" button\n'
-                       '2. Input camera parameters or reference object\n'
-                       '3. Apply calibration\n\n'
-                       'Size categories:\n'
-                       '  • Nanoplastic: <10 μm\n'
-                       '  • Small Microplastic: 10-100 μm\n'
-                       '  • Medium Microplastic: 100-1000 μm\n'
-                       '  • Large Microplastic: 1-5 mm\n'
-                       '  • Macroplastic: >5 mm',
-                       ha='center', va='center', fontsize=12,
-                       bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+                ax.text(0.5, 0.5,
+                        '📐 Camera Calibration Required\n\n'
+                        'To view size categories, please:\n'
+                        '1. Click "Camera Calibration" button\n'
+                        '2. Input camera parameters or reference object\n'
+                        '3. Apply calibration\n\n'
+                        'Size categories:\n'
+                        '  • Nanoplastic: <10 μm\n'
+                        '  • Small Microplastic: 10-100 μm\n'
+                        '  • Medium Microplastic: 100-1000 μm\n'
+                        '  • Large Microplastic: 1-5 mm\n'
+                        '  • Macroplastic: >5 mm',
+                        ha='center', va='center', fontsize=12,
+                        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
                 ax.axis('off')
-                ax.set_title('Size Categories (Calibration Required)', fontsize=14, fontweight='bold')
-            
+                ax.set_title('Size Categories (Calibration Required)',
+                             fontsize=14, fontweight='bold')
+
         elif chart_type == 'Circularity Distribution':
             ax = self.figure.add_subplot(111)
             circularities = [f['circularity'] for f in features]
-            
+
             # Add ground truth if available
             if self.ground_truth and len(self.ground_truth) > 0:
-                gt_circs = [p.get('circularity', 0) for p in self.ground_truth if 'circularity' in p]
+                gt_circs = [p.get('circularity', 0)
+                            for p in self.ground_truth if 'circularity' in p]
                 if gt_circs:
                     bins = np.linspace(0, 1, 25)
-                    ax.hist(circularities, bins=bins, alpha=0.6, label=f'Detected (n={len(circularities)})', 
-                           color='#4CAF50', edgecolor='black', linewidth=1.2)
-                    ax.hist(gt_circs, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_circs)})', 
-                           color='#FF5722', edgecolor='black', linewidth=1.2)
-                    
+                    ax.hist(circularities, bins=bins, alpha=0.6, label=f'Detected (n={len(circularities)})',
+                            color='#4CAF50', edgecolor='black', linewidth=1.2)
+                    ax.hist(gt_circs, bins=bins, alpha=0.6, label=f'Ground Truth (n={len(gt_circs)})',
+                            color='#FF5722', edgecolor='black', linewidth=1.2)
+
                     # Add mean lines
                     mean_detected = np.mean(circularities)
                     mean_gt = np.mean(gt_circs)
-                    ax.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2, 
-                              label=f'Detected Mean: {mean_detected:.3f}')
-                    ax.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2, 
-                              label=f'GT Mean: {mean_gt:.3f}')
-                    
+                    ax.axvline(mean_detected, color='#2E7D32', linestyle='--', linewidth=2,
+                               label=f'Detected Mean: {mean_detected:.3f}')
+                    ax.axvline(mean_gt, color='#D32F2F', linestyle='--', linewidth=2,
+                               label=f'GT Mean: {mean_gt:.3f}')
+
                     title_text = 'Circularity Distribution Comparison'
                 else:
-                    ax.hist(circularities, bins=30, color='lightcoral', edgecolor='black', alpha=0.7)
+                    ax.hist(circularities, bins=30, color='lightcoral',
+                            edgecolor='black', alpha=0.7)
                     mean_circ = np.mean(circularities)
-                    ax.axvline(mean_circ, color='red', linestyle='--', linewidth=2, 
-                              label=f'Mean: {mean_circ:.3f}')
+                    ax.axvline(mean_circ, color='red', linestyle='--', linewidth=2,
+                               label=f'Mean: {mean_circ:.3f}')
                     title_text = f'Circularity Distribution (n={len(features)})'
             else:
-                ax.hist(circularities, bins=30, color='lightcoral', edgecolor='black', alpha=0.7)
+                ax.hist(circularities, bins=30, color='lightcoral',
+                        edgecolor='black', alpha=0.7)
                 mean_circ = np.mean(circularities)
-                ax.axvline(mean_circ, color='red', linestyle='--', linewidth=2, 
-                          label=f'Mean: {mean_circ:.3f}')
+                ax.axvline(mean_circ, color='red', linestyle='--', linewidth=2,
+                           label=f'Mean: {mean_circ:.3f}')
                 title_text = f'Circularity Distribution (n={len(features)})'
                 if self.ground_truth_count > 0:
                     title_text += f'\nGround Truth: {self.ground_truth_count}'
-            
+
             ax.set_xlabel('Circularity', fontsize=12)
             ax.set_ylabel('Frequency', fontsize=12)
             ax.set_title(title_text, fontsize=14)
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=10)
-            
+
         elif chart_type == 'Color Distribution':
             # Single comprehensive color distribution chart
             from collections import Counter
-            
+
             # Get colors and map to 4 main colors
             colors_list = [f.get('color', 'Unknown') for f in features]
             main_colors = ['Red', 'Green', 'Blue', 'Yellow']
             color_counts = {c: 0 for c in main_colors}
-            
+
             for color_name in colors_list:
                 if 'Red' in color_name or 'Pink' in color_name or 'Orange' in color_name:
                     color_counts['Red'] += 1
@@ -3938,18 +4629,20 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     color_counts['Blue'] += 1
                 elif 'Yellow' in color_name:
                     color_counts['Yellow'] += 1
-            
+
             # Visual colors
-            visual_colors = {'Red': '#FF0000', 'Green': '#00FF00', 'Blue': '#0000FF', 'Yellow': '#FFFF00'}
-            
+            visual_colors = {'Red': '#FF0000', 'Green': '#00FF00',
+                             'Blue': '#0000FF', 'Yellow': '#FFFF00'}
+
             ax = self.figure.add_subplot(111)
-            
+
             # Check if ground truth exists
             if self.ground_truth and len(self.ground_truth) > 0:
                 # Get ground truth colors
-                gt_colors_list = [p.get('color_label', 'Unknown') for p in self.ground_truth if 'color_label' in p]
+                gt_colors_list = [p.get('color_label', 'Unknown')
+                                  for p in self.ground_truth if 'color_label' in p]
                 gt_color_counts = {c: 0 for c in main_colors}
-                
+
                 for color_name in gt_colors_list:
                     if 'Red' in color_name or 'Pink' in color_name or 'Orange' in color_name:
                         gt_color_counts['Red'] += 1
@@ -3959,34 +4652,34 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         gt_color_counts['Blue'] += 1
                     elif 'Yellow' in color_name:
                         gt_color_counts['Yellow'] += 1
-                
+
                 # Create grouped bar chart with ground truth comparison
                 x = np.arange(len(main_colors))
                 width = 0.35
-                
+
                 bars1 = ax.bar(x - width/2, [color_counts[c] for c in main_colors], width,
-                              label=f'Detected (n={len(features)})',
-                              color=[visual_colors[c] for c in main_colors],
-                              alpha=0.8, edgecolor='black', linewidth=2)
+                               label=f'Detected (n={len(features)})',
+                               color=[visual_colors[c] for c in main_colors],
+                               alpha=0.8, edgecolor='black', linewidth=2)
                 bars2 = ax.bar(x + width/2, [gt_color_counts[c] for c in main_colors], width,
-                              label=f'Ground Truth (n={len(self.ground_truth)})',
-                              color=[visual_colors[c] for c in main_colors],
-                              alpha=0.5, edgecolor='black', linewidth=2, hatch='//')
-                
+                               label=f'Ground Truth (n={len(self.ground_truth)})',
+                               color=[visual_colors[c] for c in main_colors],
+                               alpha=0.5, edgecolor='black', linewidth=2, hatch='//')
+
                 # Add count labels on bars
                 for bar in bars1:
                     height = bar.get_height()
                     if height > 0:
                         ax.text(bar.get_x() + bar.get_width()/2., height,
-                               f'{int(height)}', ha='center', va='bottom', 
-                               fontsize=13, fontweight='bold')
+                                f'{int(height)}', ha='center', va='bottom',
+                                fontsize=13, fontweight='bold')
                 for bar in bars2:
                     height = bar.get_height()
                     if height > 0:
                         ax.text(bar.get_x() + bar.get_width()/2., height,
-                               f'{int(height)}', ha='center', va='bottom', 
-                               fontsize=13, fontweight='bold')
-                
+                                f'{int(height)}', ha='center', va='bottom',
+                                fontsize=13, fontweight='bold')
+
                 ax.set_xticks(x)
                 ax.set_xticklabels(main_colors, fontsize=14, fontweight='bold')
                 ax.legend(fontsize=12, loc='upper right')
@@ -3994,9 +4687,9 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             else:
                 # No ground truth - single bar chart
                 bars = ax.bar(main_colors, [color_counts[c] for c in main_colors],
-                             color=[visual_colors[c] for c in main_colors],
-                             alpha=0.8, edgecolor='black', linewidth=2.5)
-                
+                              color=[visual_colors[c] for c in main_colors],
+                              alpha=0.8, edgecolor='black', linewidth=2.5)
+
                 # Add count labels and percentage
                 total = sum(color_counts.values())
                 for bar in bars:
@@ -4004,53 +4697,54 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     if height > 0:
                         percentage = (height / total * 100) if total > 0 else 0
                         ax.text(bar.get_x() + bar.get_width()/2., height,
-                               f'{int(height)}\n({percentage:.1f}%)', 
-                               ha='center', va='bottom', 
-                               fontsize=14, fontweight='bold')
-                
+                                f'{int(height)}\n({percentage:.1f}%)',
+                                ha='center', va='bottom',
+                                fontsize=14, fontweight='bold')
+
                 title_text = f'Color Distribution (4 Fluorescent Colors)\nTotal Particles: {len(features)}'
-            
+
             ax.set_ylabel('Count', fontsize=14, fontweight='bold')
             ax.set_xlabel('Fluorescent Color', fontsize=14, fontweight='bold')
             ax.set_title(title_text, fontsize=16, fontweight='bold', pad=20)
             ax.grid(True, alpha=0.3, axis='y')
-            
+
             # Set y-axis limit with some headroom
-            max_count = max(max(color_counts.values()), 
-                           max([gt_color_counts[c] for c in main_colors]) if self.ground_truth else 0)
+            max_count = max(max(color_counts.values()),
+                            max([gt_color_counts[c] for c in main_colors]) if self.ground_truth else 0)
             ax.set_ylim(0, max_count * 1.2 if max_count > 0 else 1)
-            
+
         elif chart_type == 'Scatter Plots':
             # Create 2x2 scatter plot matrix
             ax1 = self.figure.add_subplot(2, 2, 1)
             ax2 = self.figure.add_subplot(2, 2, 2)
             ax3 = self.figure.add_subplot(2, 2, 3)
             ax4 = self.figure.add_subplot(2, 2, 4)
-            
+
             colors_map = {'Microbead/Pellet': 'red', 'Fiber/Filament': 'blue',
-                         'Fragment': 'cyan',
-                         'Irregular': 'gray'}
-            
+                          'Fragment': 'cyan',
+                          'Irregular': 'gray'}
+
             for shape in set([f['shape'] for f in features]):
                 shape_features = [f for f in features if f['shape'] == shape]
                 areas = [f['area'] for f in shape_features]
                 circs = [f['circularity'] for f in shape_features]
-                
+
                 color = colors_map.get(shape, 'black')
-                
+
                 # Area vs Circularity
-                ax1.scatter(areas, circs, label=shape, alpha=0.6, c=color, s=50)
-                
+                ax1.scatter(areas, circs, label=shape,
+                            alpha=0.6, c=color, s=50)
+
                 # If we have eccentricity and aspect_ratio
                 if 'eccentricity' in shape_features[0]:
                     eccs = [f['eccentricity'] for f in shape_features]
                     ax2.scatter(areas, eccs, alpha=0.6, c=color, s=50)
                     ax3.scatter(circs, eccs, alpha=0.6, c=color, s=50)
-                
+
                 if 'aspect_ratio' in shape_features[0]:
                     aspects = [f['aspect_ratio'] for f in shape_features]
                     ax4.scatter(areas, aspects, alpha=0.6, c=color, s=50)
-            
+
             ax1.set_xlabel('Area')
             ax1.set_ylabel('Circularity')
             title_text = f'Area vs Circularity (n={len(features)})'
@@ -4059,102 +4753,228 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             ax1.set_title(title_text)
             ax1.legend(fontsize=8)
             ax1.grid(True, alpha=0.3)
-            
+
             ax2.set_xlabel('Area')
             ax2.set_ylabel('Eccentricity')
             ax2.set_title('Area vs Eccentricity')
             ax2.grid(True, alpha=0.3)
-            
+
             ax3.set_xlabel('Circularity')
             ax3.set_ylabel('Eccentricity')
             ax3.set_title('Circularity vs Eccentricity')
             ax3.grid(True, alpha=0.3)
-            
+
             ax4.set_xlabel('Area')
             ax4.set_ylabel('Aspect Ratio')
             ax4.set_title('Area vs Aspect Ratio')
             ax4.grid(True, alpha=0.3)
-        
+
         self.figure.tight_layout()
         self.canvas.draw()
-        
+
     def zoom_in_image(self):
         """Zoom in the original image"""
         self.image_label.zoom_in()
         self.update_zoom_label()
-        
+
     def zoom_out_image(self):
         """Zoom out the original image"""
         self.image_label.zoom_out()
         self.update_zoom_label()
-        
+
     def reset_zoom_image(self):
         """Reset zoom to 100%"""
         self.image_label.reset_zoom()
         self.update_zoom_label()
-        
+
     def toggle_zoom_box(self, checked):
         """Toggle box zoom mode"""
         self.image_label.enable_zoom_box(checked)
         if checked:
-            self.statusBar().showMessage("Box Zoom: Left-click and drag to zoom into area, Right-click to zoom out")
+            self.statusBar().showMessage(
+                "Box Zoom: Left-click and drag to zoom into area, Right-click to zoom out")
         else:
             self.statusBar().showMessage("Box Zoom disabled")
-            
+
     def update_zoom_label(self):
         """Update zoom percentage label"""
         zoom_percent = int(self.image_label.zoom_factor * 100)
         self.zoom_level_label.setText(f"Zoom: {zoom_percent}%")
-    
+
     # Zoom functions for Annotated Results view
     def zoom_in_annotated(self):
         """Zoom in the annotated image"""
         self.annotated_label.zoom_in()
         self.update_annotated_zoom_label()
-        
+
     def zoom_out_annotated(self):
         """Zoom out the annotated image"""
         self.annotated_label.zoom_out()
         self.update_annotated_zoom_label()
-        
+
     def reset_zoom_annotated(self):
         """Reset annotated image zoom to 100%"""
         self.annotated_label.reset_zoom()
         self.update_annotated_zoom_label()
-        
+
     def toggle_zoom_box_annotated(self, checked):
         """Toggle box zoom mode for annotated view"""
         self.annotated_label.enable_zoom_box(checked)
         if checked:
-            self.statusBar().showMessage("Annotated Box Zoom: Left-click and drag to zoom into area, Right-click to zoom out, Ctrl+Wheel to zoom")
+            self.statusBar().showMessage(
+                "Annotated Box Zoom: Left-click and drag to zoom into area, Right-click to zoom out, Ctrl+Wheel to zoom")
         else:
             self.statusBar().showMessage("Box Zoom disabled")
-            
+
     def update_annotated_zoom_label(self):
         """Update annotated zoom percentage label"""
         zoom_percent = int(self.annotated_label.zoom_factor * 100)
         self.annotated_zoom_level_label.setText(f"Zoom: {zoom_percent}%")
-        
+
     def save_results(self):
         """Save analysis results"""
         if self.current_result is None:
             QMessageBox.warning(self, "Warning", "No results to save")
             return
-            
+
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Results", "", 
+            self, "Save Results", "",
             "JSON Files (*.json);;CSV Files (*.csv);;All Files (*)"
         )
-        
+
         if file_path:
             self.export_results_to_file(file_path)
-            
+
+    # Add code for saving image from camera
+    def save_camera_image(self):
+        """Capture the current frame from the USB or Laptop camera and save it safely"""
+
+        frame = None
+        camera_opened_here = False
+
+        # Check if a live preview frame already exists to avoid interfering with an active stream
+        if hasattr(self, 'current_frame') and self.current_frame is not None:
+            frame = self.current_frame.copy()
+        else:
+            # 1. Fallback initialization if camera isn't running globally
+            if not hasattr(self, 'cap') or self.cap is None or not self.cap.isOpened():
+                # Quét các ID từ 1 đến 3 để tìm camera USB (ELP) trước
+                for camera_id in [1, 2, 3, 0]:
+                    self.cap = _open_camera_capture(camera_id)
+                    if self.cap is not None:
+                        camera_opened_here = True
+                        break  # Tìm thấy camera thì thoát vòng lặp
+
+                if not camera_opened_here:
+                    QMessageBox.warning(
+                        self, "Warning", "Camera is not connected or could not be opened.\n"
+                        "Please check your USB connection or laptop privacy shutter."
+                    )
+                    return
+
+            # 2. Read frame with a slight hardware delay if opened fresh
+            if camera_opened_here:
+                import time
+                time.sleep(0.5)  # Let hardware power up
+                for _ in range(10):
+                    ret, frame = self.cap.read()
+            else:
+                ret, frame = self.cap.read()
+
+            if not ret or frame is None:
+                QMessageBox.warning(
+                    self, "Warning", "Failed to capture image from camera.")
+                if camera_opened_here:
+                    self.cap.release()
+                    self.cap = None
+                return
+
+        # 3. Open the file dialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Image", "",
+            "PNG Files (*.png);;JPEG Files (*.jpg *.jpeg);;All Files (*)"
+        )
+
+        # 4. Save the image using a Unicode-safe method
+        if file_path:
+            try:
+                # Extract extension to format correctly
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext not in ['.png', '.jpg', '.jpeg']:
+                    ext = '.png'  # Default fallback extension
+                    file_path += ext
+
+                # Encode to memory buffer first to bypass OpenCV path limitations
+                success, img_encoded = cv2.imencode(ext, frame)
+
+                if success:
+                    # Write natively via Python to handle any folder naming characters safely
+                    with open(file_path, 'wb') as f:
+                        f.write(img_encoded.tobytes())
+                    QMessageBox.information(
+                        self, "Success", "Image saved successfully!")
+                else:
+                    QMessageBox.critical(
+                        self, "Error", "Failed to format the image for saving.")
+
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error", f"An error occurred while saving: {str(e)}")
+
+        # 5. Clean up camera connection if opened solely for this action
+        if camera_opened_here and hasattr(self, 'cap') and self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        # End code
+
+    # save image after analysis
+    def save_annotated_image(self):
+        """Save the annotated results image (with bounding boxes and labels)"""
+        if not hasattr(self, 'annotated_image') or self.annotated_image is None:
+            QMessageBox.warning(
+                self, "Warning",
+                "No annotated image available.\nRun Quick Analysis or Deep Analysis first."
+            )
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Annotated Image", "",
+            "PNG Files (*.png);;JPEG Files (*.jpg *.jpeg);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext not in ['.png', '.jpg', '.jpeg']:
+                ext = '.png'
+                file_path += ext
+
+            # annotated_image is RGB (since it's drawn for on-screen display) -> convert to BGR for OpenCV
+            img_bgr = cv2.cvtColor(self.annotated_image, cv2.COLOR_RGB2BGR)
+            success, img_encoded = cv2.imencode(ext, img_bgr)
+
+            if success:
+                with open(file_path, 'wb') as f:
+                    f.write(img_encoded.tobytes())
+                QMessageBox.information(
+                    self, "Success", "Annotated image saved successfully!")
+            else:
+                QMessageBox.critical(
+                    self, "Error", "Failed to format the image for saving.")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"An error occurred while saving: {str(e)}")
+    # End save_annotated_image
+
     def export_results(self, format_type):
         """Export results in specified format"""
         if self.current_result is None:
             QMessageBox.warning(self, "Warning", "No results to export")
             return
-            
+
         if format_type == 'json':
             file_path, _ = QFileDialog.getSaveFileName(
                 self, "Export JSON", "", "JSON Files (*.json)"
@@ -4163,10 +4983,10 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             file_path, _ = QFileDialog.getSaveFileName(
                 self, "Export CSV", "", "CSV Files (*.csv)"
             )
-            
+
         if file_path:
             self.export_results_to_file(file_path)
-            
+
     def export_results_to_file(self, file_path):
         """Export results to file"""
         try:
@@ -4190,28 +5010,29 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 }
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=2)
-                    
+
             elif file_path.endswith('.csv'):
                 # Export as CSV
                 import pandas as pd
                 df = pd.DataFrame(self.current_result.features)
                 df.to_csv(file_path, index=False)
-                
-            QMessageBox.information(self, "Success", f"Results exported to {file_path}")
-            
+
+            QMessageBox.information(
+                self, "Success", f"Results exported to {file_path}")
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export: {str(e)}")
-            
+
     def generate_synthetic(self):
         """Generate synthetic data (batch)"""
         dialog = SyntheticDataDialog(self)
         dialog.exec_()
-    
+
     def generate_synthetic_single(self):
         """Generate a single synthetic image and load it"""
         try:
             self.statusBar().showMessage('Generating synthetic image...')
-            
+
             # Get synthetic parameters from UI
             params = SyntheticImageParams(
                 num_particles=self.synth_num_particles.value(),
@@ -4230,99 +5051,107 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 background_brightness=self.synth_brightness.value(),
                 particle_brightness=self.synth_particle_brightness.value()
             )
-            
+
             # Generate image
             generator = SyntheticImageGenerator()
             image, ground_truth = generator.generate(params)
-            
+
             # Load the generated image
             self.current_image = image
             self.image_label.set_image(image)
-            
+
             # Store ground truth
             self.ground_truth = ground_truth
             self.ground_truth_count = len(ground_truth)
-            
+
             # Enable analysis buttons
             self.quick_btn.setEnabled(True)
             self.deep_btn.setEnabled(True)
             self.both_btn.setEnabled(True)
-            
-            self.statusBar().showMessage(f'Generated synthetic image with {len(ground_truth)} particles (Ground Truth)')
-            
+
+            self.statusBar().showMessage(
+                f'Generated synthetic image with {len(ground_truth)} particles (Ground Truth)')
+
             # Show ground truth info
             gt_text = f"Generated {len(ground_truth)} particles:\n"
             from collections import Counter
             # Map ground truth shapes to grouped names for display
-            shapes = Counter([map_to_grouped_shape(p['shape']) for p in ground_truth])
+            shapes = Counter([map_to_grouped_shape(p['shape'])
+                             for p in ground_truth])
             for shape, count in shapes.items():
                 gt_text += f"  {shape}: {count}\n"
-            
+
             QMessageBox.information(self, "Synthetic Image Generated", gt_text)
-            
+
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to generate: {str(e)}")
-    
+            QMessageBox.critical(
+                self, "Error", f"Failed to generate: {str(e)}")
+
     def export_yolo_dataset(self):
         """Export YOLO training dataset with synthetic images and annotations"""
         try:
             from pathlib import Path
             from src.data_generation.yolo_exporter import YOLODatasetExporter, print_dataset_stats
-            
+
             # Ask user for dataset configuration
             from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QSpinBox, QDialogButtonBox, QComboBox, QCheckBox
-            
+
             dialog = QDialog(self)
             dialog.setWindowTitle("Export YOLO Training Dataset")
             dialog.setMinimumWidth(450)
-            
+
             layout = QVBoxLayout()
-            
+
             # Description
             desc = QLabel("Generate synthetic microplastic images with YOLOv8 format annotations.\n\n"
-                         "This will create a dataset structure with:\n"
-                         "  • images/train/, images/val/, images/test/\n"
-                         "  • labels/train/, labels/val/, labels/test/\n"
-                         "  • dataset.yaml configuration file")
+                          "This will create a dataset structure with:\n"
+                          "  • images/train/, images/val/, images/test/\n"
+                          "  • labels/train/, labels/val/, labels/test/\n"
+                          "  • dataset.yaml configuration file")
             desc.setWordWrap(True)
             layout.addWidget(desc)
-            
+
             # Number of training images
             train_label = QLabel("Training Images:")
             layout.addWidget(train_label)
             train_spin = QSpinBox()
             train_spin.setRange(10, 10000)
             train_spin.setValue(500)
-            train_spin.setToolTip("Number of synthetic images to generate for training")
+            train_spin.setToolTip(
+                "Number of synthetic images to generate for training")
             layout.addWidget(train_spin)
-            
+
             # Number of validation images
             val_label = QLabel("Validation Images:")
             layout.addWidget(val_label)
             val_spin = QSpinBox()
             val_spin.setRange(10, 5000)
             val_spin.setValue(100)
-            val_spin.setToolTip("Number of synthetic images to generate for validation")
+            val_spin.setToolTip(
+                "Number of synthetic images to generate for validation")
             layout.addWidget(val_spin)
-            
+
             # Number of test images
             test_label = QLabel("Test Images:")
             layout.addWidget(test_label)
             test_spin = QSpinBox()
             test_spin.setRange(0, 5000)
             test_spin.setValue(100)
-            test_spin.setToolTip("Number of synthetic images to generate for testing (final evaluation)")
+            test_spin.setToolTip(
+                "Number of synthetic images to generate for testing (final evaluation)")
             layout.addWidget(test_spin)
-            
+
             # Use current synthetic parameters checkbox
             use_current_params = QCheckBox("Use Current Synthetic Parameters")
             use_current_params.setChecked(True)
-            use_current_params.setToolTip("Use the parameters currently set in the Synthetic Image Parameters section")
+            use_current_params.setToolTip(
+                "Use the parameters currently set in the Synthetic Image Parameters section")
             layout.addWidget(use_current_params)
-            
+
             # Append mode checkbox
             layout.addWidget(QLabel(""))  # Spacing
-            append_mode_checkbox = QCheckBox("Append to Existing Dataset (Don't Overwrite)")
+            append_mode_checkbox = QCheckBox(
+                "Append to Existing Dataset (Don't Overwrite)")
             append_mode_checkbox.setChecked(False)
             append_mode_checkbox.setToolTip(
                 "If checked, new images will be added to the existing dataset\n"
@@ -4330,72 +5159,85 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 "new images will start from train_00501).\n\n"
                 "If unchecked, numbering starts from 0 (may overwrite existing files)."
             )
-            append_mode_checkbox.setStyleSheet("QCheckBox { color: #0066cc; font-weight: bold; }")
+            append_mode_checkbox.setStyleSheet(
+                "QCheckBox { color: #0066cc; font-weight: bold; }")
             layout.addWidget(append_mode_checkbox)
-            
+
             # Buttons
-            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
             layout.addWidget(buttons)
-            
+
             dialog.setLayout(layout)
-            
+
             if dialog.exec_() != QDialog.Accepted:
                 return
-            
+
             num_train = train_spin.value()
             num_val = val_spin.value()
             num_test = test_spin.value()
             append_mode = append_mode_checkbox.isChecked()
-            
+
             # Ask for output directory
-            output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for YOLO Dataset")
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for YOLO Dataset")
             if not output_dir:
                 return
-            
+
             output_path = Path(output_dir) / 'yolo_microplastic_dataset'
             output_path.mkdir(parents=True, exist_ok=True)
-            
+
             # Check for existing files if append mode is enabled
             train_start_idx = 0
             val_start_idx = 0
             test_start_idx = 0
-            
+
             if append_mode:
                 # Count existing files
                 train_images_dir = output_path / 'images' / 'train'
                 val_images_dir = output_path / 'images' / 'val'
                 test_images_dir = output_path / 'images' / 'test'
-                
+
                 if train_images_dir.exists():
-                    train_start_idx = len(list(train_images_dir.glob('train_*.png')))
+                    train_start_idx = len(
+                        list(train_images_dir.glob('train_*.png')))
                 if val_images_dir.exists():
                     val_start_idx = len(list(val_images_dir.glob('val_*.png')))
                 if test_images_dir.exists():
-                    test_start_idx = len(list(test_images_dir.glob('test_*.png')))
-                
+                    test_start_idx = len(
+                        list(test_images_dir.glob('test_*.png')))
+
                 if train_start_idx > 0 or val_start_idx > 0 or test_start_idx > 0:
                     self.results_text.append("\n" + "="*60)
-                    self.results_text.append("APPEND MODE: Adding to existing dataset")
+                    self.results_text.append(
+                        "APPEND MODE: Adding to existing dataset")
                     self.results_text.append("="*60)
                     if train_start_idx > 0:
-                        self.results_text.append(f"  Existing training images: {train_start_idx}")
-                        self.results_text.append(f"  New training images will start from train_{train_start_idx:05d}")
+                        self.results_text.append(
+                            f"  Existing training images: {train_start_idx}")
+                        self.results_text.append(
+                            f"  New training images will start from train_{train_start_idx:05d}")
                     if val_start_idx > 0:
-                        self.results_text.append(f"  Existing validation images: {val_start_idx}")
-                        self.results_text.append(f"  New validation images will start from val_{val_start_idx:05d}")
+                        self.results_text.append(
+                            f"  Existing validation images: {val_start_idx}")
+                        self.results_text.append(
+                            f"  New validation images will start from val_{val_start_idx:05d}")
                     if test_start_idx > 0:
-                        self.results_text.append(f"  Existing test images: {test_start_idx}")
-                        self.results_text.append(f"  New test images will start from test_{test_start_idx:05d}")
+                        self.results_text.append(
+                            f"  Existing test images: {test_start_idx}")
+                        self.results_text.append(
+                            f"  New test images will start from test_{test_start_idx:05d}")
                     self.results_text.append("="*60)
                 else:
-                    self.results_text.append("\n⚠ Append mode enabled but no existing files found. Starting from 0.")
-            
+                    self.results_text.append(
+                        "\n⚠ Append mode enabled but no existing files found. Starting from 0.")
+
             self.statusBar().showMessage('Exporting YOLO dataset...')
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, num_train + num_val + num_test)
-            
+
             # Get synthetic parameters
             if use_current_params.isChecked():
                 params = SyntheticImageParams(
@@ -4418,9 +5260,9 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             else:
                 # Use default parameters
                 params = SyntheticImageParams()
-            
+
             generator = SyntheticImageGenerator()
-            
+
             # Create directory structure first
             images_train_dir = output_path / 'images' / 'train'
             labels_train_dir = output_path / 'labels' / 'train'
@@ -4428,32 +5270,35 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             images_train_dir.mkdir(parents=True, exist_ok=True)
             labels_train_dir.mkdir(parents=True, exist_ok=True)
             ground_truth_train_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # Generate and save training set (one by one)
             self.results_text.append("\n=== Generating Training Set ===")
             if append_mode and train_start_idx > 0:
-                self.results_text.append(f"Starting from index {train_start_idx}")
+                self.results_text.append(
+                    f"Starting from index {train_start_idx}")
             train_count = 0
             for i in range(num_train):
                 image, ground_truth = generator.generate(params)
                 image_idx = train_start_idx + i  # Use offset for append mode
                 name = f'train_{image_idx:05d}'
-                
+
                 # Save immediately to disk
                 YOLODatasetExporter.save_single_image(
-                    image, ground_truth, name, 
+                    image, ground_truth, name,
                     images_train_dir, labels_train_dir, ground_truth_train_dir
                 )
                 train_count += 1
-                
+
                 self.progress_bar.setValue(i + 1)
-                self.statusBar().showMessage(f'Generated & saved training image {i+1}/{num_train}')
+                self.statusBar().showMessage(
+                    f'Generated & saved training image {i+1}/{num_train}')
                 if (i + 1) % 10 == 0:  # Update text every 10 images
-                    self.results_text.append(f"  Saved {i+1}/{num_train} images...")
+                    self.results_text.append(
+                        f"  Saved {i+1}/{num_train} images...")
                 QApplication.processEvents()
-            
+
             self.results_text.append(f"✓ Saved {train_count} training images")
-            
+
             # Create validation directories
             images_val_dir = output_path / 'images' / 'val'
             labels_val_dir = output_path / 'labels' / 'val'
@@ -4461,32 +5306,35 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             images_val_dir.mkdir(parents=True, exist_ok=True)
             labels_val_dir.mkdir(parents=True, exist_ok=True)
             ground_truth_val_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # Generate and save validation set (one by one)
             self.results_text.append("\n=== Generating Validation Set ===")
             if append_mode and val_start_idx > 0:
-                self.results_text.append(f"Starting from index {val_start_idx}")
+                self.results_text.append(
+                    f"Starting from index {val_start_idx}")
             val_count = 0
             for i in range(num_val):
                 image, ground_truth = generator.generate(params)
                 image_idx = val_start_idx + i  # Use offset for append mode
                 name = f'val_{image_idx:05d}'
-                
+
                 # Save immediately to disk
                 YOLODatasetExporter.save_single_image(
-                    image, ground_truth, name, 
+                    image, ground_truth, name,
                     images_val_dir, labels_val_dir, ground_truth_val_dir
                 )
                 val_count += 1
-                
+
                 self.progress_bar.setValue(num_train + i + 1)
-                self.statusBar().showMessage(f'Generated & saved validation image {i+1}/{num_val}')
+                self.statusBar().showMessage(
+                    f'Generated & saved validation image {i+1}/{num_val}')
                 if (i + 1) % 10 == 0:  # Update text every 10 images
-                    self.results_text.append(f"  Saved {i+1}/{num_val} images...")
+                    self.results_text.append(
+                        f"  Saved {i+1}/{num_val} images...")
                 QApplication.processEvents()
-            
+
             self.results_text.append(f"✓ Saved {val_count} validation images")
-            
+
             # Generate and save test set (if requested, one by one)
             test_count = 0
             if num_test > 0:
@@ -4497,34 +5345,38 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 images_test_dir.mkdir(parents=True, exist_ok=True)
                 labels_test_dir.mkdir(parents=True, exist_ok=True)
                 ground_truth_test_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 self.results_text.append("\n=== Generating Test Set ===")
                 if append_mode and test_start_idx > 0:
-                    self.results_text.append(f"Starting from index {test_start_idx}")
+                    self.results_text.append(
+                        f"Starting from index {test_start_idx}")
                 for i in range(num_test):
                     image, ground_truth = generator.generate(params)
                     image_idx = test_start_idx + i  # Use offset for append mode
                     name = f'test_{image_idx:05d}'
-                    
+
                     # Save immediately to disk
                     YOLODatasetExporter.save_single_image(
-                        image, ground_truth, name, 
+                        image, ground_truth, name,
                         images_test_dir, labels_test_dir, ground_truth_test_dir
                     )
                     test_count += 1
-                    
+
                     self.progress_bar.setValue(num_train + num_val + i + 1)
-                    self.statusBar().showMessage(f'Generated & saved test image {i+1}/{num_test}')
+                    self.statusBar().showMessage(
+                        f'Generated & saved test image {i+1}/{num_test}')
                     if (i + 1) % 10 == 0:  # Update text every 10 images
-                        self.results_text.append(f"  Saved {i+1}/{num_test} images...")
+                        self.results_text.append(
+                            f"  Saved {i+1}/{num_test} images...")
                     QApplication.processEvents()
-                
+
                 self.results_text.append(f"✓ Saved {test_count} test images")
-            
+
             # Create dataset.yaml
             yaml_path = YOLODatasetExporter.create_dataset_yaml(output_path)
-            self.results_text.append(f"✓ Created dataset configuration: {yaml_path.name}")
-            
+            self.results_text.append(
+                f"✓ Created dataset configuration: {yaml_path.name}")
+
             # Show total dataset size if in append mode
             if append_mode:
                 total_train = train_start_idx + train_count
@@ -4533,101 +5385,112 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 self.results_text.append("\n" + "="*60)
                 self.results_text.append("Dataset Summary (After Appending):")
                 self.results_text.append("="*60)
-                self.results_text.append(f"  Total training images: {total_train} (Added {train_count} new)")
-                self.results_text.append(f"  Total validation images: {total_val} (Added {val_count} new)")
+                self.results_text.append(
+                    f"  Total training images: {total_train} (Added {train_count} new)")
+                self.results_text.append(
+                    f"  Total validation images: {total_val} (Added {val_count} new)")
                 if test_count > 0:
-                    self.results_text.append(f"  Total test images: {total_test} (Added {test_count} new)")
+                    self.results_text.append(
+                        f"  Total test images: {total_test} (Added {test_count} new)")
                 self.results_text.append("="*60)
-            
+
             # Get and display statistics
             stats = YOLODatasetExporter.get_dataset_stats(output_path)
             self.results_text.append("\n=== Dataset Statistics ===")
             for split in ['train', 'val', 'test']:
                 if stats[split]['total'] > 0:
                     self.results_text.append(f"\n{split.upper()}:")
-                    self.results_text.append(f"  Images: {stats[split]['total']}")
+                    self.results_text.append(
+                        f"  Images: {stats[split]['total']}")
                     for class_name, count in stats[split]['classes'].items():
                         if count > 0:
-                            self.results_text.append(f"    {class_name}: {count}")
-            
+                            self.results_text.append(
+                                f"    {class_name}: {count}")
+
             self.progress_bar.setVisible(False)
-            self.statusBar().showMessage(f'YOLO dataset exported successfully to {output_path}')
-            
+            self.statusBar().showMessage(
+                f'YOLO dataset exported successfully to {output_path}')
+
             # Show success message with next steps
             if append_mode:
                 total_train = train_start_idx + train_count
                 total_val = val_start_idx + val_count
                 total_test = test_start_idx + test_count
                 success_msg = (f"✓ YOLO dataset updated successfully!\n\n"
-                              f"Location: {output_path}\n\n"
-                              f"New Training images: {train_count}\n"
-                              f"New Validation images: {val_count}\n"
-                              f"New Test images: {test_count}\n\n"
-                              f"TOTAL Training images: {total_train}\n"
-                              f"TOTAL Validation images: {total_val}\n"
-                              f"TOTAL Test images: {total_test}\n\n"
-                              f"✓ Old data preserved - files numbered sequentially!\n\n")
+                               f"Location: {output_path}\n\n"
+                               f"New Training images: {train_count}\n"
+                               f"New Validation images: {val_count}\n"
+                               f"New Test images: {test_count}\n\n"
+                               f"TOTAL Training images: {total_train}\n"
+                               f"TOTAL Validation images: {total_val}\n"
+                               f"TOTAL Test images: {total_test}\n\n"
+                               f"✓ Old data preserved - files numbered sequentially!\n\n")
             else:
                 success_msg = (f"✓ YOLO dataset exported successfully!\n\n"
-                              f"Location: {output_path}\n\n"
-                              f"Training images: {train_count}\n"
-                              f"Validation images: {val_count}\n"
-                              f"Test images: {test_count}\n\n")
-            
+                               f"Location: {output_path}\n\n"
+                               f"Training images: {train_count}\n"
+                               f"Validation images: {val_count}\n"
+                               f"Test images: {test_count}\n\n")
+
             success_msg += (f"Next steps:\n"
-                           f"1. Review the dataset.yaml file\n"
-                           f"2. Train your model using YOLOv8:\n"
-                           f"   yolo detect train data={yaml_path.name} model=yolov8s.pt epochs=100\n"
-                           f"3. Evaluate on test set:\n"
-                           f"   yolo detect val data={yaml_path.name} model=runs/detect/train/weights/best.pt split=test\n\n"
-                           f"See YOLO_TRAINING_GUIDE.md for detailed instructions.")
-            
+                            f"1. Review the dataset.yaml file\n"
+                            f"2. Train your model using YOLOv8:\n"
+                            f"   yolo detect train data={yaml_path.name} model=yolov8s.pt epochs=100\n"
+                            f"3. Evaluate on test set:\n"
+                            f"   yolo detect val data={yaml_path.name} model=runs/detect/train/weights/best.pt split=test\n\n"
+                            f"See YOLO_TRAINING_GUIDE.md for detailed instructions.")
+
             title = "YOLO Dataset Updated" if append_mode else "YOLO Dataset Exported"
             QMessageBox.information(self, title, success_msg)
-            
+
         except Exception as e:
             import traceback
-            self.results_text.append(f"\n✗ Error exporting YOLO dataset: {str(e)}")
+            self.results_text.append(
+                f"\n✗ Error exporting YOLO dataset: {str(e)}")
             self.results_text.append(traceback.format_exc())
-            QMessageBox.critical(self, "Error", f"Failed to export YOLO dataset:\n{str(e)}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to export YOLO dataset:\n{str(e)}")
             self.progress_bar.setVisible(False)
-            
+
     def load_yolo_model(self):
         """Load YOLO model for ML detection"""
         if not YOLO_AVAILABLE:
             self._show_yolo_installation_guide()
             return
-            
+
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Load YOLO Model", "", 
+            self, "Load YOLO Model", "",
             "Model Files (*.pt *.pth);;All Files (*)"
         )
-        
+
         if file_path:
             try:
                 self.statusBar().showMessage('Loading YOLO model...')
                 self.yolo_model = YOLO(file_path)
                 self.yolo_model_path = file_path
-                
+
                 model_name = Path(file_path).name
                 self.ml_model_label.setText(f"Model: {model_name}")
-                self.ml_model_label.setStyleSheet("color: green; font-weight: bold;")
+                self.ml_model_label.setStyleSheet(
+                    "color: green; font-weight: bold;")
                 self.run_ml_btn.setEnabled(True)
                 self.run_ml_benchmark_btn.setEnabled(True)
-                
+
                 self.statusBar().showMessage(f'Loaded model: {model_name}')
-                QMessageBox.information(self, "Success", f"YOLO model loaded:\n{model_name}")
-                
+                QMessageBox.information(
+                    self, "Success", f"YOLO model loaded:\n{model_name}")
+
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load model:\n{str(e)}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to load model:\n{str(e)}")
                 self.ml_model_label.setText("Model load failed")
                 self.ml_model_label.setStyleSheet("color: red;")
-    
+
     def _show_yolo_installation_guide(self):
         """Show detailed installation guide for YOLO"""
         import sys
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        
+
         if sys.version_info >= (3, 13):
             title = f"YOLO Not Available (Python {py_version})"
             message = (
@@ -4663,7 +5526,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 f"</ol>"
                 f"<p><b>Your Python version ({py_version}) is compatible!</b></p>"
             )
-        
+
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle(title)
         msg_box.setTextFormat(Qt.RichText)
@@ -4671,33 +5534,34 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         msg_box.setIcon(QMessageBox.Information)
         msg_box.setStandardButtons(QMessageBox.Ok)
         msg_box.exec_()
-                
+
     def run_yolo_detection(self):
         """Run YOLO detection on current image"""
         if self.current_image is None:
             QMessageBox.warning(self, "Warning", "Please load an image first")
             return
-            
+
         if self.yolo_model is None:
-            QMessageBox.warning(self, "Warning", "Please load a YOLO model first")
+            QMessageBox.warning(
+                self, "Warning", "Please load a YOLO model first")
             return
-            
+
         try:
             import time
             start_time = time.time()
-            
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)
             self.statusBar().showMessage('Running YOLO detection...')
-            
+
             # Run detection
             results = self.yolo_model(self.current_image)
-            
+
             # Extract detections and create features for statistics
             detections = []
             features = []
             annotated_image = self.current_image.copy()
-            
+
             for result in results:
                 boxes = result.boxes
                 for i, box in enumerate(boxes):
@@ -4705,15 +5569,16 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     conf = box.conf[0].cpu().numpy()
                     cls = int(box.cls[0].cpu().numpy())
-                    
+
                     # Get class name
-                    class_name = result.names[cls] if cls < len(result.names) else f"Class_{cls}"
-                    
+                    class_name = result.names[cls] if cls < len(
+                        result.names) else f"Class_{cls}"
+
                     # Calculate bbox dimensions
                     bbox_w = int(x2 - x1)
                     bbox_h = int(y2 - y1)
                     bbox_area = bbox_w * bbox_h
-                    
+
                     # Store detection
                     detections.append({
                         'id': i + 1,
@@ -4722,7 +5587,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         'bbox': [int(x1), int(y1), bbox_w, bbox_h],
                         'center': [int((x1+x2)/2), int((y1+y2)/2)]
                     })
-                    
+
                     # Create feature for statistics
                     feature = {
                         'id': i + 1,
@@ -4738,16 +5603,17 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         'bbox_global': [int(x1), int(y1), bbox_w, bbox_h]
                     }
                     features.append(feature)
-                    
+
                     # Draw on image
                     color = (0, 255, 0) if conf > 0.5 else (255, 165, 0)
-                    cv2.rectangle(annotated_image, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                    cv2.rectangle(annotated_image, (int(x1), int(
+                        y1)), (int(x2), int(y2)), color, 2)
                     label = f"{class_name}: {conf:.2f}"
-                    cv2.putText(annotated_image, label, (int(x1), int(y1)-5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
+                    cv2.putText(annotated_image, label, (int(x1), int(y1)-5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
             processing_time = time.time() - start_time
-            
+
             # Create AnalysisResult object for statistics
             from config.settings import AnalysisResult, PreprocessingParams
             ml_result = AnalysisResult(
@@ -4757,126 +5623,133 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 params=PreprocessingParams(),
                 analysis_type='ml_yolo',
                 num_detections=len(features),
-                image_dimensions=(self.current_image.shape[1], self.current_image.shape[0])
+                image_dimensions=(
+                    self.current_image.shape[1], self.current_image.shape[0])
             )
-            
+
             # Store result for statistics
             self.ml_result = ml_result
             self.current_result = ml_result
-            
+
             # Display annotated image
             self.annotated_label.set_image(annotated_image)
             self.tabs.setCurrentIndex(2)  # Switch to annotated tab
-            
+
             # Update results
             result_text = f"YOLO Detection Results\n"
             result_text += f"Model: {Path(self.yolo_model_path).name}\n"
             result_text += f"Detections: {len(detections)}\n"
             result_text += f"Processing Time: {processing_time:.2f}s\n\n"
-            
+
             from collections import Counter
             classes = Counter([d['class'] for d in detections])
             result_text += "Class Distribution:\n"
             for cls, count in classes.most_common():
                 result_text += f"  {cls}: {count}\n"
-            
+
             self.results_text.setText(result_text)
-            
+
             # Update table with ML detections
             self.update_ml_results_table(detections)
-            
+
             # Update statistics charts with YOLO results
             self.update_charts_full()
-            
+
             self.progress_bar.setVisible(False)
-            self.statusBar().showMessage(f'ML Detection complete: {len(detections)} objects detected')
-            
+            self.statusBar().showMessage(
+                f'ML Detection complete: {len(detections)} objects detected')
+
         except Exception as e:
             self.progress_bar.setVisible(False)
-            QMessageBox.critical(self, "Error", f"YOLO detection failed:\n{str(e)}")
-            
+            QMessageBox.critical(
+                self, "Error", f"YOLO detection failed:\n{str(e)}")
+
     def run_ml_benchmark(self):
         """Run ML Benchmark analysis with full shape/color metrics"""
         if self.yolo_model is None:
-            QMessageBox.warning(self, "Warning", "Please load a YOLO model first")
+            QMessageBox.warning(
+                self, "Warning", "Please load a YOLO model first")
             return
-        
+
         # Ask user: single image or batch processing
         from PyQt5.QtWidgets import QInputDialog
-        
+
         items = ["Single Image (Current)", "Batch Processing (Folder)"]
-        item, ok = QInputDialog.getItem(self, "ML Benchmark Mode", 
-                                       "Select benchmark mode:", items, 0, False)
-        
+        item, ok = QInputDialog.getItem(self, "ML Benchmark Mode",
+                                        "Select benchmark mode:", items, 0, False)
+
         if not ok:
             return
-        
+
         if "Single" in item:
             self._run_single_ml_benchmark()
         else:
             self._run_batch_ml_benchmark()
-    
+
     def _run_single_ml_benchmark(self):
         """Run ML Benchmark on single current image"""
         if self.current_image is None:
             QMessageBox.warning(self, "Warning", "Please load an image first")
             return
-            
+
         try:
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)
             self.statusBar().showMessage('Running ML Benchmark analysis...')
-            
+
             # Run ML Benchmark analysis
-            params = self.get_analysis_params('deep')  # Use deep params for consistency
+            # Use deep params for consistency
+            params = self.get_analysis_params('deep')
             ml_analyzer = MLBenchmarkAnalyzer(self.yolo_model)
             ml_result = ml_analyzer.analyze(self.current_image, params)
-            
+
             # Store result
             self.ml_result = ml_result
             self.current_result = ml_result
-            
+
             # Create annotated visualization
             annotated_image = self.current_image.copy()
             for feature in ml_result.features:
                 bbox = feature.get('bbox_global', feature.get('bounding_box'))
                 if bbox:
-                    x, y, w, h = bbox
+                    # bbox_global is now full-precision (float); cv2 drawing needs ints.
+                    x, y, w, h = (int(round(v)) for v in bbox)
                     # Color code by confidence if available
                     conf = feature.get('ml_confidence', 1.0)
                     color = (0, 255, 0) if conf > 0.5 else (255, 165, 0)
-                    cv2.rectangle(annotated_image, (x, y), (x+w, y+h), color, 2)
-                    
+                    cv2.rectangle(annotated_image, (x, y),
+                                  (x+w, y+h), color, 2)
+
                     # Add label with shape and ML class
                     shape = feature.get('shape', '')
                     ml_class = feature.get('ml_class', '')
                     label = f"{shape} ({ml_class}:{conf:.2f})"
                     cv2.putText(annotated_image, label, (x, y-5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
             # Display annotated image
             self.annotated_label.set_image(annotated_image)
             self.tabs.setCurrentIndex(2)  # Switch to annotated tab
-            
+
             # Update results text
             result_text = "=== ML BENCHMARK ANALYSIS ===\n\n"
             result_text += f"Model: {Path(self.yolo_model_path).name}\n"
             result_text += f"Detections: {ml_result.num_detections}\n"
             result_text += f"Processing Time: {ml_result.processing_time:.2f}s\n\n"
-            
+
             # Shape distribution
             from collections import Counter
             shapes = Counter([f['shape'] for f in ml_result.features])
             result_text += "Shape Distribution:\n"
             for shape, count in shapes.most_common():
                 result_text += f"  {shape}: {count}\n"
-            
+
             # Color distribution
             colors = Counter([f['color'] for f in ml_result.features])
             result_text += "\nColor Distribution:\n"
             for color, count in colors.most_common():
                 result_text += f"  {color}: {count}\n"
-            
+
             # Statistics summary
             if ml_result.features:
                 circs = [f['circularity'] for f in ml_result.features]
@@ -4884,57 +5757,59 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 result_text += f"\nStatistics:\n"
                 result_text += f"  Circularity: {np.mean(circs):.3f} ± {np.std(circs):.3f}\n"
                 result_text += f"  Aspect Ratio: {np.mean(aspects):.2f} ± {np.std(aspects):.2f}\n"
-            
+
             self.results_text.setText(result_text)
-            
+
             # Update table
             self.update_results_table(ml_result)
-            
+
             # Update statistics charts with ML results
             self.update_charts_full()
-            
+
             self.progress_bar.setVisible(False)
-            self.statusBar().showMessage(f'ML Benchmark complete: {ml_result.num_detections} particles detected')
-            
+            self.statusBar().showMessage(
+                f'ML Benchmark complete: {ml_result.num_detections} particles detected')
+
         except Exception as e:
             self.progress_bar.setVisible(False)
             import traceback
             traceback.print_exc()
-            QMessageBox.critical(self, "Error", f"ML Benchmark failed:\n{str(e)}")
-    
+            QMessageBox.critical(
+                self, "Error", f"ML Benchmark failed:\n{str(e)}")
+
     def _run_batch_ml_benchmark(self):
         """Run ML Benchmark on batch of images from folder"""
         # Ask for image folder or generate synthetic images
         from PyQt5.QtWidgets import QInputDialog
-        
+
         items = ["Load Image Folder", "Generate Synthetic Images"]
-        item, ok = QInputDialog.getItem(self, "Batch Source", 
-                                       "Select image source:", items, 0, False)
-        
+        item, ok = QInputDialog.getItem(self, "Batch Source",
+                                        "Select image source:", items, 0, False)
+
         if not ok:
             return
-        
+
         images_data = []
-        
+
         if "Generate" in item:
             # Generate synthetic images
             num_images, ok = QInputDialog.getInt(self, "Number of Images",
                                                  "How many synthetic images?", 200, 1, 1000, 10)
             if not ok:
                 return
-            
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, num_images)
             self.statusBar().showMessage('Generating synthetic images...')
-            
+
             from src.data_generation import SyntheticImageGenerator
             from config.settings import SyntheticImageParams
             generator = SyntheticImageGenerator()
-            
+
             for i in range(num_images):
                 self.progress_bar.setValue(i)
                 QApplication.processEvents()
-                
+
                 # Generate with parameters from GUI interface
                 import random
                 params = SyntheticImageParams(
@@ -4950,64 +5825,74 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     background_brightness=self.synth_brightness.value(),
                     particle_brightness=self.synth_particle_brightness.value()
                 )
-                
+
                 image, ground_truth = generator.generate(params)
-                
+
                 images_data.append({
                     'image': image,
                     'ground_truth': len(ground_truth),
                     'ground_truth_data': ground_truth,
-                    'name': f'synthetic_{i+1:03d}'
+                    'name': f'synthetic_{i+1:03d}',
+                    'source_path': None,
+                    'ground_truth_path': None,
+                    'ground_truth_error': 'generated synthetic records do not include object bounding boxes'
                 })
         else:
             # Load images from folder
-            folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select Image Folder")
             if not folder:
                 return
-            
             from pathlib import Path
+            source_kind = 'folder'
+            source_folder = Path(folder)
             image_files = []
             for ext in ['*.png', '*.jpg', '*.jpeg', '*.tiff', '*.bmp']:
                 image_files.extend(Path(folder).glob(ext))
+            image_files = sorted(image_files, key=lambda path: path.as_posix().lower())
             
             if not image_files:
-                QMessageBox.warning(self, "Warning", "No images found in folder")
+                QMessageBox.warning(
+                    self, "Warning", "No images found in folder")
                 return
-            
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, len(image_files))
-            
+
             for i, img_path in enumerate(image_files):
                 self.progress_bar.setValue(i)
                 QApplication.processEvents()
-                
+
                 image = cv2.imread(str(img_path))
                 if image is not None:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    
+
                     # Try to load ground truth with full particle details
                     ground_truth_count = 0
                     ground_truth_data = []
+                    ground_truth_error = None
                     gt_path = self._find_ground_truth_file(img_path)
-                    
+
                     if gt_path and gt_path.exists():
                         try:
                             with open(gt_path, 'r') as f:
                                 content = f.read().strip()
-                                
+
                                 # Parse ground truth file
                                 # Support two formats:
                                 # Format 1 (simple): "Particles: N\nShapes:\n  1. Fragment\n  2. Fiber..."
                                 # Format 2 (detailed): "Total Particles: N\n\nParticle 1:\n  Shape: ...\n  Color: ..."
                                 lines = content.split('\n')
-                                
+
                                 # Get total count (try both formats)
                                 if lines and 'Particles:' in lines[0]:
-                                    ground_truth_count = int(lines[0].split(':')[1].strip())
-                                
+                                    ground_truth_count = int(
+                                        lines[0].split(':')[1].strip())
+
                                 # Check format type
-                                is_simple_format = any('Shapes:' in line for line in lines)
-                                
+                                is_simple_format = any(
+                                    'Shapes:' in line for line in lines)
+
                                 if is_simple_format:
                                     # Parse simple format: just numbered shapes
                                     in_shapes_section = False
@@ -5019,100 +5904,80 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                                         if in_shapes_section and line:
                                             # Line format: "  1. Fragment" or "1. Fragment"
                                             if '.' in line:
-                                                shape = line.split('.', 1)[1].strip()
+                                                shape = line.split('.', 1)[
+                                                    1].strip()
                                                 ground_truth_data.append({
                                                     'shape': shape
                                                 })
                                 else:
-                                    # Parse detailed format with full particle info
-                                    current_particle = {}
-                                    for line in lines[1:]:
-                                        line = line.strip()
-                                        if not line:
-                                            if current_particle:
-                                                ground_truth_data.append(current_particle)
-                                                current_particle = {}
-                                            continue
-                                        
-                                        if line.startswith('Particle '):
-                                            if current_particle:
-                                                ground_truth_data.append(current_particle)
-                                            current_particle = {}
-                                        elif ':' in line:
-                                            key, value = line.split(':', 1)
-                                            key = key.strip()
-                                            value = value.strip()
-                                            
-                                            if key == 'Shape':
-                                                current_particle['shape'] = value
-                                            elif key == 'Color':
-                                                current_particle['color_label'] = value
-                                            elif key == 'Wavelength':
-                                                current_particle['wavelength'] = int(value.replace('nm', ''))
-                                            elif key == 'Position':
-                                                # Parse (x, y) format
-                                                pos_str = value.strip('()')
-                                                x, y = pos_str.split(',')
-                                                current_particle['position'] = (float(x.strip()), float(y.strip()))
-                                            elif key == 'Area':
-                                                current_particle['area'] = float(value.split()[0])
-                                            elif key == 'Size':
-                                                current_particle['size'] = float(value.split()[0])
-                                    
-                                    # Add last particle
-                                    if current_particle:
-                                        ground_truth_data.append(current_particle)
+                                    from src.analysis.detection_metrics import parse_benchmark_ground_truth
+                                    ground_truth_data = parse_benchmark_ground_truth(
+                                        content,
+                                        image_size=(image.shape[1], image.shape[0])
+                                    )
                                     
                         except Exception as e:
-                            print(f"Warning: Could not parse ground truth from {gt_path}: {e}")
+                            logger.warning(f"Warning: Could not parse ground truth from {gt_path}: {e}")
                             ground_truth_data = []
+                            ground_truth_error = str(e)
+                    elif ground_truth_count == 0:
+                        ground_truth_error = 'ground-truth file was not found'
                     
                     images_data.append({
                         'image': image,
                         'ground_truth': ground_truth_count,
                         'ground_truth_data': ground_truth_data,
-                        'name': img_path.stem
+                        'name': img_path.stem,
+                        'source_path': str(img_path.resolve()),
+                        'ground_truth_path': str(gt_path.resolve()) if gt_path and gt_path.exists() else None,
+                        'ground_truth_error': ground_truth_error
                     })
-        
+
         if not images_data:
             QMessageBox.warning(self, "Warning", "No images to process")
             self.progress_bar.setVisible(False)
             return
-        
+
         # Count how many images have ground truth
-        images_with_gt = sum(1 for img in images_data if img['ground_truth'] > 0)
-        
+        images_with_gt = sum(
+            1 for img in images_data if img['ground_truth'] > 0)
+
         # Run all three analyses on all images
         self.results_text.clear()
         self.results_text.append("=" * 60)
-        self.results_text.append(f"ML BENCHMARK BATCH - {len(images_data)} IMAGES")
+        self.results_text.append(
+            f"ML BENCHMARK BATCH - {len(images_data)} IMAGES")
         self.results_text.append("=" * 60)
         if images_with_gt > 0:
-            self.results_text.append(f"✓ Ground truth loaded for {images_with_gt}/{len(images_data)} images")
+            self.results_text.append(
+                f"✓ Ground truth loaded for {images_with_gt}/{len(images_data)} images")
         else:
             self.results_text.append(f"⚠ No ground truth files found")
-        
+
         quick_results_list = []
         deep_results_list = []
         ml_results_list = []
-        
-        self.progress_bar.setRange(0, len(images_data) * 3)  # Quick + Deep + ML
-        
+
+        self.progress_bar.setRange(
+            0, len(images_data) * 3)  # Quick + Deep + ML
+
         import time
         from collections import Counter
-        
+
         # Process all images with Quick Analysis
-        self.results_text.append(f"\n[1/3] Running Quick Analysis on {len(images_data)} images...")
+        self.results_text.append(
+            f"\n[1/3] Running Quick Analysis on {len(images_data)} images...")
         QApplication.processEvents()
-        
+
         quick_params = self.get_analysis_params('quick')
         quick_analyzer = QuickAnalyzer()
-        
+
         for i, img_data in enumerate(images_data):
             self.progress_bar.setValue(i)
-            self.statusBar().showMessage(f'Quick Analysis: {i+1}/{len(images_data)}')
+            self.statusBar().showMessage(
+                f'Quick Analysis: {i+1}/{len(images_data)}')
             QApplication.processEvents()
-            
+
             result = quick_analyzer.analyze(img_data['image'], quick_params)
             quick_results_list.append({
                 'name': img_data['name'],
@@ -5121,19 +5986,21 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 'time': result.processing_time,
                 'result': result
             })
-        
+
         # Process all images with Deep Analysis
-        self.results_text.append(f"\n[2/3] Running Deep Analysis on {len(images_data)} images...")
+        self.results_text.append(
+            f"\n[2/3] Running Deep Analysis on {len(images_data)} images...")
         QApplication.processEvents()
-        
+
         deep_params = self.get_analysis_params('deep')
         deep_analyzer = DeepAnalyzer()
-        
+
         for i, img_data in enumerate(images_data):
             self.progress_bar.setValue(len(images_data) + i)
-            self.statusBar().showMessage(f'Deep Analysis: {i+1}/{len(images_data)}')
+            self.statusBar().showMessage(
+                f'Deep Analysis: {i+1}/{len(images_data)}')
             QApplication.processEvents()
-            
+
             result = deep_analyzer.analyze(img_data['image'], deep_params)
             deep_results_list.append({
                 'name': img_data['name'],
@@ -5142,19 +6009,27 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 'time': result.processing_time,
                 'result': result
             })
-        
+
         # Process all images with ML Benchmark
-        self.results_text.append(f"\n[3/3] Running ML Benchmark on {len(images_data)} images...")
+        self.results_text.append(
+            f"\n[3/3] Running ML Benchmark on {len(images_data)} images...")
         QApplication.processEvents()
         
+        from config.settings import MLModelConfig
+        ml_confidence_threshold = MLModelConfig().confidence_threshold
         ml_analyzer = MLBenchmarkAnalyzer(self.yolo_model)
-        
+
         for i, img_data in enumerate(images_data):
             self.progress_bar.setValue(len(images_data) * 2 + i)
-            self.statusBar().showMessage(f'ML Benchmark: {i+1}/{len(images_data)}')
+            self.statusBar().showMessage(
+                f'ML Benchmark: {i+1}/{len(images_data)}')
             QApplication.processEvents()
             
-            result = ml_analyzer.analyze(img_data['image'], deep_params)
+            result = ml_analyzer.analyze(
+                img_data['image'],
+                deep_params,
+                confidence_threshold=ml_confidence_threshold
+            )
             ml_results_list.append({
                 'name': img_data['name'],
                 'detected': result.num_detections,
@@ -5162,60 +6037,73 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                 'time': result.processing_time,
                 'result': result
             })
-        
+
         # Calculate aggregate statistics
         import numpy as np
-        
+
         quick_detections = [r['detected'] for r in quick_results_list]
         deep_detections = [r['detected'] for r in deep_results_list]
         ml_detections = [r['detected'] for r in ml_results_list]
         quick_times = [r['time'] for r in quick_results_list]
         deep_times = [r['time'] for r in deep_results_list]
         ml_times = [r['time'] for r in ml_results_list]
-        
-        ground_truths = [r['ground_truth'] for r in quick_results_list if r['ground_truth'] > 0]
-        
+
+        ground_truths = [r['ground_truth']
+                         for r in quick_results_list if r['ground_truth'] > 0]
+
         # Display summary
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("ML BENCHMARK SUMMARY")
         self.results_text.append("=" * 60)
-        
+
         self.results_text.append(f"\nProcessed: {len(images_data)} images")
-        
+
         # Display results in comparison table format
         if ground_truths:
             self.results_text.append("\n" + "-" * 60)
-            self.results_text.append(f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
+            self.results_text.append(
+                f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
             self.results_text.append("-" * 60)
-            self.results_text.append(f"{'Ground Truth':<20} {np.mean(ground_truths):<20.1f} {'N/A':<20}")
-            self.results_text.append(f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
-            self.results_text.append(f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
-            self.results_text.append(f"{'ML Benchmark':<20} {np.mean(ml_detections):<20.1f} {np.mean(ml_times):<20.3f}")
+            self.results_text.append(
+                f"{'Ground Truth':<20} {np.mean(ground_truths):<20.1f} {'N/A':<20}")
+            self.results_text.append(
+                f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
+            self.results_text.append(
+                f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
+            self.results_text.append(
+                f"{'ML Benchmark':<20} {np.mean(ml_detections):<20.1f} {np.mean(ml_times):<20.3f}")
             self.results_text.append("-" * 60)
         else:
             self.results_text.append("\n" + "-" * 60)
-            self.results_text.append(f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
+            self.results_text.append(
+                f"{'Method':<20} {'Avg Detections':<20} {'Avg Time (s)':<20}")
             self.results_text.append("-" * 60)
-            self.results_text.append(f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
-            self.results_text.append(f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
-            self.results_text.append(f"{'ML Benchmark':<20} {np.mean(ml_detections):<20.1f} {np.mean(ml_times):<20.3f}")
+            self.results_text.append(
+                f"{'Quick Analysis':<20} {np.mean(quick_detections):<20.1f} {np.mean(quick_times):<20.3f}")
+            self.results_text.append(
+                f"{'Deep Analysis':<20} {np.mean(deep_detections):<20.1f} {np.mean(deep_times):<20.3f}")
+            self.results_text.append(
+                f"{'ML Benchmark':<20} {np.mean(ml_detections):<20.1f} {np.mean(ml_times):<20.3f}")
             self.results_text.append("-" * 60)
-        
+
         # Generate HTML report with all three methods
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("GENERATING HTML REPORT...")
         QApplication.processEvents()
-        
+
         try:
             from datetime import datetime
             from pathlib import Path
+            from src.analysis.benchmark_batch import build_ml_batch_payload
+            from src.analysis.benchmark_snapshot import save_benchmark_snapshot
             from src.analysis.report_generator import ReportGenerator
             
-            # Calculate metrics for all three methods
-            def calculate_batch_metrics(detections_list, ground_truths_list):
+            # Preserve the old count formula only as an internal diagnostic.
+            # These values are overwritten below and never reported as detection metrics.
+            def calculate_legacy_count_diagnostic(detections_list, ground_truths_list):
                 if not ground_truths_list or len(ground_truths_list) == 0:
                     return 0.0, 0.0, 0.0
-                
+
                 total_tp = total_fp = total_fn = 0
                 for detected, gt in zip(detections_list, ground_truths_list):
                     if gt > 0:
@@ -5225,11 +6113,14 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         total_tp += tp
                         total_fp += fp
                         total_fn += fn
-                
-                precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-                recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-                
+
+                precision = total_tp / \
+                    (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+                recall = total_tp / \
+                    (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+                f1 = 2 * (precision * recall) / (precision +
+                                                 recall) if (precision + recall) > 0 else 0.0
+
                 return precision, recall, f1
             
             gt_values = [r['ground_truth'] for r in quick_results_list if r['ground_truth'] > 0]
@@ -5237,14 +6128,14 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             deep_det_with_gt = [r['detected'] for r in deep_results_list if r['ground_truth'] > 0]
             ml_det_with_gt = [r['detected'] for r in ml_results_list if r['ground_truth'] > 0]
             
-            quick_precision, quick_recall, quick_f1 = calculate_batch_metrics(quick_det_with_gt, gt_values)
-            deep_precision, deep_recall, deep_f1 = calculate_batch_metrics(deep_det_with_gt, gt_values)
-            ml_precision, ml_recall, ml_f1 = calculate_batch_metrics(ml_det_with_gt, gt_values)
+            quick_precision, quick_recall, quick_f1 = calculate_legacy_count_diagnostic(quick_det_with_gt, gt_values)
+            deep_precision, deep_recall, deep_f1 = calculate_legacy_count_diagnostic(deep_det_with_gt, gt_values)
+            ml_precision, ml_recall, ml_f1 = calculate_legacy_count_diagnostic(ml_det_with_gt, gt_values)
             
             # Aggregate distributions for all three methods
             # Use consistent grouping and color filtering for all methods
             fluorescent_colors = {'Red', 'Green', 'Blue', 'Yellow'}
-            
+
             quick_shapes = Counter()
             quick_colors = Counter()
             quick_areas = []
@@ -5257,7 +6148,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         if color in fluorescent_colors:
                             quick_colors[color] += 1
                         quick_areas.append(f.get('area', 0))
-            
+
             deep_shapes = Counter()
             deep_colors = Counter()
             deep_areas = []
@@ -5270,7 +6161,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         if color in fluorescent_colors:
                             deep_colors[color] += 1
                         deep_areas.append(f.get('area', 0))
-            
+
             ml_shapes = Counter()
             ml_colors = Counter()
             ml_areas = []
@@ -5283,7 +6174,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         if color in fluorescent_colors:
                             ml_colors[color] += 1
                         ml_areas.append(f.get('area', 0))
-            
+
             # Collect ground truth distributions if available
             # Map to grouped shapes and filter to fluorescent colors
             gt_shapes = Counter()
@@ -5301,7 +6192,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                                 gt_colors[color] += 1
                         if 'area' in particle:
                             gt_areas.append(particle['area'])
-            
+
             # Create batch data with ML Benchmark included
             batch_data = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -5347,51 +6238,73 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                     'area_distribution': gt_areas
                 } if gt_shapes or gt_colors or gt_areas else None
             }
+
+            # The report and sidecar use class-aware one-to-one IoU metrics.
+            report_timestamp = datetime.now()
+            batch_data, evidence = build_ml_batch_payload(
+                images_data,
+                {
+                    'quick_analysis': quick_results_list,
+                    'deep_analysis': deep_results_list,
+                    'ml_benchmark': ml_results_list,
+                },
+                timestamp=report_timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                model_path=self.yolo_model_path,
+                confidence_threshold=ml_confidence_threshold,
+            )
             
             report_gen = ReportGenerator()
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp = report_timestamp.strftime('%Y%m%d_%H%M%S')
             output_dir = Path('benchmark_results')
             output_dir.mkdir(exist_ok=True)
-            
-            html_path = output_dir / f'ml_benchmark_{len(images_data)}images_{timestamp}.html'
+
+            html_path = output_dir / \
+                f'ml_benchmark_{len(images_data)}images_{timestamp}.html'
             report_gen.generate_benchmark_report(batch_data, str(html_path))
+            snapshot_path = save_benchmark_snapshot(html_path, evidence)
             
             self.results_text.append(f"\n✓ HTML Report saved: {html_path}")
-            
+
             # Open in browser
             import webbrowser
             webbrowser.open(f'file:///{html_path.absolute()}')
-            
+
         except Exception as e:
             self.results_text.append(f"\n✗ Failed to generate report: {e}")
             import traceback
             traceback.print_exc()
-        
+
         self.progress_bar.setVisible(False)
-        self.statusBar().showMessage(f'ML Benchmark complete - {len(images_data)} images processed')
+        self.statusBar().showMessage(
+            f'ML Benchmark complete - {len(images_data)} images processed')
         self.results_text.append("\n" + "=" * 60)
         self.results_text.append("ML BENCHMARK COMPLETE")
         self.results_text.append("=" * 60)
-            
+
     def update_ml_results_table(self, detections):
         """Update table with ML detection results"""
         columns = ['ID', 'Class', 'Confidence', 'X', 'Y', 'Width', 'Height']
-        
+
         self.results_table.setColumnCount(len(columns))
         self.results_table.setHorizontalHeaderLabels(columns)
         self.results_table.setRowCount(len(detections))
-        
+
         for i, det in enumerate(detections):
             self.results_table.setItem(i, 0, QTableWidgetItem(str(det['id'])))
             self.results_table.setItem(i, 1, QTableWidgetItem(det['class']))
-            self.results_table.setItem(i, 2, QTableWidgetItem(f"{det['confidence']:.3f}"))
-            self.results_table.setItem(i, 3, QTableWidgetItem(str(det['bbox'][0])))
-            self.results_table.setItem(i, 4, QTableWidgetItem(str(det['bbox'][1])))
-            self.results_table.setItem(i, 5, QTableWidgetItem(str(det['bbox'][2])))
-            self.results_table.setItem(i, 6, QTableWidgetItem(str(det['bbox'][3])))
-        
+            self.results_table.setItem(
+                i, 2, QTableWidgetItem(f"{det['confidence']:.3f}"))
+            self.results_table.setItem(
+                i, 3, QTableWidgetItem(str(det['bbox'][0])))
+            self.results_table.setItem(
+                i, 4, QTableWidgetItem(str(det['bbox'][1])))
+            self.results_table.setItem(
+                i, 5, QTableWidgetItem(str(det['bbox'][2])))
+            self.results_table.setItem(
+                i, 6, QTableWidgetItem(str(det['bbox'][3])))
+
         self.results_table.resizeColumnsToContents()
-        
+
     def set_fluorescent_params(self):
         """Set optimal parameters for fluorescent microscopy (black background)"""
         # Quick Analysis settings
@@ -5399,7 +6312,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.quick_min_area.setValue(10)
         self.quick_blur.setValue(3)
         self.quick_distance_thresh.setValue(0.3)
-        
+
         # Deep Analysis settings
         self.deep_method.setCurrentText('advanced')
         self.deep_min_area.setValue(5)
@@ -5407,7 +6320,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.deep_distance_thresh.setValue(0.3)
         self.deep_marker_size.setValue(3)
         self.adaptive_c_value.setValue(1)
-        
+
         self.statusBar().showMessage('Parameters optimized for fluorescent microscopy')
         QMessageBox.information(
             self,
@@ -5420,7 +6333,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             "• Distance threshold: 0.3\n\n"
             "These settings work best with dark backgrounds and bright particles."
         )
-    
+
     def set_brightfield_params(self):
         """Set optimal parameters for brightfield microscopy (white background)"""
         # Quick Analysis settings
@@ -5428,7 +6341,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.quick_min_area.setValue(50)
         self.quick_blur.setValue(5)
         self.quick_distance_thresh.setValue(0.5)
-        
+
         # Deep Analysis settings
         self.deep_method.setCurrentText('basic')
         self.deep_min_area.setValue(10)
@@ -5436,7 +6349,7 @@ class MicroplasticAnalyzerGUI(QMainWindow):
         self.deep_distance_thresh.setValue(0.5)
         self.deep_marker_size.setValue(5)
         self.adaptive_c_value.setValue(2)
-        
+
         self.statusBar().showMessage('Parameters optimized for brightfield microscopy')
         QMessageBox.information(
             self,
@@ -5448,24 +6361,26 @@ class MicroplasticAnalyzerGUI(QMainWindow):
             "• Distance threshold: 0.5\n\n"
             "These settings work best with bright backgrounds."
         )
-    
+
     def open_calibration_dialog(self):
         """Open camera calibration dialog"""
         dialog = CameraCalibrationDialog(self)
-        
+
         # Set current calibration if available
         if self.calibration.is_calibrated:
             dialog.calibration = self.calibration
             dialog.update_status()
-        
+
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             self.calibration = dialog.get_calibration()
-            
+
             # Update status label
             if self.calibration.is_calibrated:
-                self.calibration_status.setText(f"✓ Calibrated: {self.calibration.um_per_pixel_x:.3f} μm/pixel")
-                self.calibration_status.setStyleSheet("color: green; font-weight: bold;")
-                
+                self.calibration_status.setText(
+                    f"✓ Calibrated: {self.calibration.um_per_pixel_x:.3f} μm/pixel")
+                self.calibration_status.setStyleSheet(
+                    "color: green; font-weight: bold;")
+
                 # Refresh results if image is loaded
                 if self.current_result is not None:
                     self.update_results_table(self.current_result)
@@ -5473,13 +6388,15 @@ class MicroplasticAnalyzerGUI(QMainWindow):
                         f"Calibration applied: {self.calibration.um_per_pixel_x:.3f} μm/pixel"
                     )
             else:
-                self.calibration_status.setText("⚠ Not calibrated - sizes in pixels")
-                self.calibration_status.setStyleSheet("color: orange; font-weight: bold;")
-        
+                self.calibration_status.setText(
+                    "⚠ Not calibrated - sizes in pixels")
+                self.calibration_status.setStyleSheet(
+                    "color: orange; font-weight: bold;")
+
     def show_about(self):
         """Show about dialog"""
         QMessageBox.about(
-            self, 
+            self,
             "About Microplastic Analyzer",
             "Microplastic Analyzer Pro\n\n"
             "Version 2.0 (Refactored)\n\n"
@@ -5497,22 +6414,23 @@ class MicroplasticAnalyzerGUI(QMainWindow):
 
 class SyntheticDataDialog(QtWidgets.QDialog):
     """Dialog for generating synthetic data (batch generation)"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Batch Generate Synthetic Data")
         self.setModal(True)
         self.parent_gui = parent
         self.initUI()
-        
+
     def initUI(self):
         layout = QVBoxLayout(self)
-        
+
         # Info label
-        info_label = QLabel("Generate multiple synthetic images using current parameters")
+        info_label = QLabel(
+            "Generate multiple synthetic images using current parameters")
         info_label.setStyleSheet("font-weight: bold; padding: 5px;")
         layout.addWidget(info_label)
-        
+
         # Number of images
         num_layout = QHBoxLayout()
         num_layout.addWidget(QLabel("Number of images:"))
@@ -5521,7 +6439,7 @@ class SyntheticDataDialog(QtWidgets.QDialog):
         self.num_spin.setValue(10)
         num_layout.addWidget(self.num_spin)
         layout.addLayout(num_layout)
-        
+
         # Output directory
         dir_layout = QHBoxLayout()
         dir_layout.addWidget(QLabel("Output directory:"))
@@ -5531,40 +6449,41 @@ class SyntheticDataDialog(QtWidgets.QDialog):
         browse_btn.clicked.connect(self.browse_directory)
         dir_layout.addWidget(browse_btn)
         layout.addLayout(dir_layout)
-        
+
         # Save ground truth checkbox
         self.save_gt_checkbox = QCheckBox("Save ground truth JSON files")
         self.save_gt_checkbox.setChecked(True)
         layout.addWidget(self.save_gt_checkbox)
-        
+
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
+
         # Buttons
         button_layout = QHBoxLayout()
         generate_btn = QPushButton("Generate")
-        generate_btn.setStyleSheet("padding: 8px; font-weight: bold; background-color: #4CAF50;")
+        generate_btn.setStyleSheet(
+            "padding: 8px; font-weight: bold; background-color: #4CAF50;")
         generate_btn.clicked.connect(self.generate)
         button_layout.addWidget(generate_btn)
-        
+
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
-        
+
         layout.addLayout(button_layout)
-        
+
     def browse_directory(self):
         directory = QFileDialog.getExistingDirectory(self, "Select Directory")
         if directory:
             self.dir_edit.setText(directory)
-            
+
     def generate(self):
         num_images = self.num_spin.value()
         output_dir = Path(self.dir_edit.text())
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         try:
             # Get parameters from parent GUI
             params = SyntheticImageParams(
@@ -5584,52 +6503,54 @@ class SyntheticDataDialog(QtWidgets.QDialog):
                 background_brightness=self.parent_gui.synth_brightness.value(),
                 particle_brightness=self.parent_gui.synth_particle_brightness.value()
             )
-            
+
             generator = SyntheticImageGenerator()
-            
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, num_images)
-            
+
             for i in range(num_images):
                 image, ground_truth = generator.generate(params)
-                
+
                 # Save image
                 image_file = output_dir / f"synthetic_{i+1:04d}.png"
-                cv2.imwrite(str(image_file), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-                
+                cv2.imwrite(str(image_file), cv2.cvtColor(
+                    image, cv2.COLOR_RGB2BGR))
+
                 # Save ground truth if requested
                 if self.save_gt_checkbox.isChecked():
                     gt_file = output_dir / f"synthetic_{i+1:04d}_gt.json"
                     with open(gt_file, 'w') as f:
                         json.dump(ground_truth, f, indent=2)
-                
+
                 self.progress_bar.setValue(i + 1)
-            
+
             self.progress_bar.setVisible(False)
-            
+
             QMessageBox.information(
-                self, 
-                "Success", 
+                self,
+                "Success",
                 f"Generated {num_images} images in:\n{output_dir}"
             )
             self.accept()
-            
+
         except Exception as e:
             self.progress_bar.setVisible(False)
-            QMessageBox.critical(self, "Error", f"Generation failed:\n{str(e)}")
+            QMessageBox.critical(
+                self, "Error", f"Generation failed:\n{str(e)}")
 
 
 def main():
     """Main entry point for GUI"""
     app = QtWidgets.QApplication(sys.argv)
-    
+
     # Set application style
     app.setStyle('Fusion')
-    
+
     # Create and show main window
     window = MicroplasticAnalyzerGUI()
     window.show()
-    
+
     sys.exit(app.exec_())
 
 
